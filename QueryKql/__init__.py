@@ -4,25 +4,36 @@ import re
 import urllib.request
 import urllib.error
 
-import azure.functions as func
-from azure.identity import DefaultAzureCredential
 
-LOG_ANALYTICS_SCOPE = "https://api.loganalytics.io/.default"
-
+IMDS_ENDPOINT = "http://169.254.169.254/metadata/identity/oauth2/token"
+LOG_ANALYTICS_RESOURCE = "https://api.loganalytics.io/"
 MAX_ROWS = 200
 DEFAULT_ROWS = 50
 MAX_HOURS = 24
 
 
-def parse_timespan_to_hours(timespan: str) -> float:
-    if not isinstance(timespan, str):
-        raise ValueError("timespan must be a string")
+def get_managed_identity_token():
+    url = (
+        f"{IMDS_ENDPOINT}"
+        f"?api-version=2018-02-01"
+        f"&resource={LOG_ANALYTICS_RESOURCE}"
+    )
 
+    req = urllib.request.Request(
+        url,
+        headers={"Metadata": "true"},
+        method="GET"
+    )
+
+    with urllib.request.urlopen(req, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+        return payload["access_token"]
+
+
+def parse_timespan_to_hours(timespan: str) -> float:
     m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?", timespan)
     if m:
-        h = int(m.group(1) or 0)
-        mins = int(m.group(2) or 0)
-        return h + mins / 60
+        return int(m.group(1) or 0) + int(m.group(2) or 0) / 60
 
     d = re.fullmatch(r"P(\d+)D", timespan)
     if d:
@@ -37,34 +48,22 @@ def kql_safety_check(kql: str):
     if re.fullmatch(r"\s*search\s+\*\s*", lowered):
         raise ValueError("KQL too broad: 'search *' is not allowed")
 
-    blocked = [
-        "externaldata",
-        "evaluate",
-        "make-series",
-        "mv-expand"
-    ]
-
-    for b in blocked:
-        if b in lowered:
-            raise ValueError(f"KQL contains blocked operator: {b}")
+    for blocked in ["externaldata", "evaluate", "make-series", "mv-expand"]:
+        if blocked in lowered:
+            raise ValueError(f"KQL contains blocked operator: {blocked}")
 
 
 def ensure_take_limit(kql: str, limit: int) -> str:
-    lowered = kql.lower()
-    if " take " in lowered or " limit " in lowered:
+    if " take " in kql.lower() or " limit " in kql.lower():
         return kql
     return f"{kql}\n| take {limit}"
 
 
 def query_log_analytics(workspace_id, kql, timespan):
-    credential = DefaultAzureCredential()
-    token = credential.get_token(LOG_ANALYTICS_SCOPE).token
+    token = get_managed_identity_token()
 
     url = f"https://api.loganalytics.io/v1/workspaces/{workspace_id}/query"
-    payload = {
-        "query": kql,
-        "timespan": timespan
-    }
+    payload = {"query": kql, "timespan": timespan}
 
     req = urllib.request.Request(
         url,
@@ -80,15 +79,15 @@ def query_log_analytics(workspace_id, kql, timespan):
         return json.loads(response.read().decode("utf-8"))
 
 
-def main(req: func.HttpRequest) -> func.HttpResponse:
+def main(req):
     try:
         workspace_id = os.environ.get("WORKSPACE_ID")
         if not workspace_id:
-            return func.HttpResponse(
-                json.dumps({"error": "WORKSPACE_ID app setting not configured"}),
-                status_code=500,
-                mimetype="application/json"
-            )
+            return {
+                "status": 500,
+                "body": json.dumps({"error": "WORKSPACE_ID not configured"}),
+                "headers": {"Content-Type": "application/json"}
+            }
 
         body = req.get_json()
         kql = body.get("kql")
@@ -96,47 +95,45 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         max_rows = int(body.get("max_rows", DEFAULT_ROWS))
 
         if not kql:
-            return func.HttpResponse(
-                json.dumps({"error": "Missing 'kql' in request body"}),
-                status_code=400,
-                mimetype="application/json"
-            )
+            return {
+                "status": 400,
+                "body": json.dumps({"error": "Missing 'kql' in request body"}),
+                "headers": {"Content-Type": "application/json"}
+            }
 
         max_rows = max(1, min(max_rows, MAX_ROWS))
         hours = parse_timespan_to_hours(timespan)
 
         if hours <= 0 or hours > MAX_HOURS:
-            raise ValueError("timespan exceeds allowed limit (max 24h)")
+            raise ValueError("timespan exceeds max allowed window (24h)")
 
         kql_safety_check(kql)
         kql = ensure_take_limit(kql, max_rows)
 
         data = query_log_analytics(workspace_id, kql, timespan)
 
-        result = {
-            "meta": {
-                "timespan": timespan,
-                "max_rows": max_rows,
-                "note": "Results are bounded for Copilot-safe execution"
-            },
-            "data": data
+        return {
+            "status": 200,
+            "body": json.dumps({
+                "meta": {
+                    "timespan": timespan,
+                    "max_rows": max_rows,
+                    "note": "Bounded, Copilot-safe result"
+                },
+                "data": data
+            }),
+            "headers": {"Content-Type": "application/json"}
         }
 
-        return func.HttpResponse(
-            json.dumps(result),
-            status_code=200,
-            mimetype="application/json"
-        )
-
     except urllib.error.HTTPError as e:
-        return func.HttpResponse(
-            e.read().decode("utf-8"),
-            status_code=e.code,
-            mimetype="application/json"
-        )
+        return {
+            "status": e.code,
+            "body": e.read().decode("utf-8"),
+            "headers": {"Content-Type": "application/json"}
+        }
     except Exception as e:
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500,
-            mimetype="application/json"
-        )
+        return {
+            "status": 500,
+            "body": json.dumps({"error": str(e)}),
+            "headers": {"Content-Type": "application/json"}
+        }
