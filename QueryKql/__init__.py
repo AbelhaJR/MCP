@@ -1,9 +1,9 @@
+import azure.functions as func
 import json
 import os
 import re
 import urllib.request
 import urllib.error
-
 
 IMDS_ENDPOINT = "http://169.254.169.254/metadata/identity/oauth2/token"
 LOG_ANALYTICS_RESOURCE = "https://api.loganalytics.io/"
@@ -44,7 +44,6 @@ def parse_timespan_to_hours(timespan: str) -> float:
 
 def kql_safety_check(kql: str):
     lowered = kql.lower()
-
     if re.fullmatch(r"\s*search\s+\*\s*", lowered):
         raise ValueError("KQL too broad: 'search *' is not allowed")
 
@@ -61,7 +60,6 @@ def ensure_take_limit(kql: str, limit: int) -> str:
 
 def query_log_analytics(workspace_id, kql, timespan):
     token = get_managed_identity_token()
-
     url = f"https://api.loganalytics.io/v1/workspaces/{workspace_id}/query"
     payload = {"query": kql, "timespan": timespan}
 
@@ -79,15 +77,15 @@ def query_log_analytics(workspace_id, kql, timespan):
         return json.loads(response.read().decode("utf-8"))
 
 
-def main(req):
+def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
         workspace_id = os.environ.get("WORKSPACE_ID")
         if not workspace_id:
-            return {
-                "status": 500,
-                "body": json.dumps({"error": "WORKSPACE_ID not configured"}),
-                "headers": {"Content-Type": "application/json"}
-            }
+            return func.HttpResponse(
+                json.dumps({"error": "WORKSPACE_ID not configured"}),
+                status_code=500,
+                mimetype="application/json"
+            )
 
         body = req.get_json()
         kql = body.get("kql")
@@ -95,11 +93,11 @@ def main(req):
         max_rows = int(body.get("max_rows", DEFAULT_ROWS))
 
         if not kql:
-            return {
-                "status": 400,
-                "body": json.dumps({"error": "Missing 'kql' in request body"}),
-                "headers": {"Content-Type": "application/json"}
-            }
+            return func.HttpResponse(
+                json.dumps({"error": "Missing 'kql' in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
 
         max_rows = max(1, min(max_rows, MAX_ROWS))
         hours = parse_timespan_to_hours(timespan)
@@ -112,9 +110,8 @@ def main(req):
 
         data = query_log_analytics(workspace_id, kql, timespan)
 
-        return {
-            "status": 200,
-            "body": json.dumps({
+        return func.HttpResponse(
+            json.dumps({
                 "meta": {
                     "timespan": timespan,
                     "max_rows": max_rows,
@@ -122,18 +119,19 @@ def main(req):
                 },
                 "data": data
             }),
-            "headers": {"Content-Type": "application/json"}
-        }
+            status_code=200,
+            mimetype="application/json"
+        )
 
     except urllib.error.HTTPError as e:
-        return {
-            "status": e.code,
-            "body": e.read().decode("utf-8"),
-            "headers": {"Content-Type": "application/json"}
-        }
+        return func.HttpResponse(
+            e.read().decode("utf-8"),
+            status_code=e.code,
+            mimetype="application/json"
+        )
     except Exception as e:
-        return {
-            "status": 500,
-            "body": json.dumps({"error": str(e)}),
-            "headers": {"Content-Type": "application/json"}
-        }
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
