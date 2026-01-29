@@ -7,12 +7,40 @@ import urllib.error
 
 IMDS_ENDPOINT = "http://169.254.169.254/metadata/identity/oauth2/token"
 LOG_ANALYTICS_RESOURCE = "https://api.loganalytics.io/"
+
 MAX_ROWS = 200
 DEFAULT_ROWS = 50
 MAX_HOURS = 24
 
 
-def get_managed_identity_token():
+def get_managed_identity_token() -> str:
+    """
+    Managed Identity token without azure-identity.
+    Prefer Functions/App Service identity endpoint if present; fallback to IMDS.
+    """
+
+    # Functions/App Service endpoints (preferred)
+    identity_endpoint = os.environ.get("IDENTITY_ENDPOINT") or os.environ.get("MSI_ENDPOINT")
+    identity_header = os.environ.get("IDENTITY_HEADER") or os.environ.get("MSI_SECRET")
+
+    if identity_endpoint and identity_header:
+        sep = "&" if "?" in identity_endpoint else "?"
+        url = f"{identity_endpoint}{sep}resource={LOG_ANALYTICS_RESOURCE}&api-version=2019-08-01"
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                "X-IDENTITY-HEADER": identity_header,
+                "Metadata": "true",
+            },
+            method="GET",
+        )
+
+        with urllib.request.urlopen(req, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            return payload["access_token"]
+
+    # Fallback: IMDS (may be blocked in some Azure Functions environments)
     url = (
         f"{IMDS_ENDPOINT}"
         f"?api-version=2018-02-01"
@@ -22,7 +50,7 @@ def get_managed_identity_token():
     req = urllib.request.Request(
         url,
         headers={"Metadata": "true"},
-        method="GET"
+        method="GET",
     )
 
     with urllib.request.urlopen(req, timeout=10) as response:
@@ -58,7 +86,7 @@ def ensure_take_limit(kql: str, limit: int) -> str:
     return f"{kql}\n| take {limit}"
 
 
-def query_log_analytics(workspace_id, kql, timespan):
+def query_log_analytics(workspace_id: str, kql: str, timespan: str) -> dict:
     token = get_managed_identity_token()
     url = f"https://api.loganalytics.io/v1/workspaces/{workspace_id}/query"
     payload = {"query": kql, "timespan": timespan}
@@ -68,9 +96,9 @@ def query_log_analytics(workspace_id, kql, timespan):
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         },
-        method="POST"
+        method="POST",
     )
 
     with urllib.request.urlopen(req, timeout=20) as response:
@@ -84,7 +112,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse(
                 json.dumps({"error": "WORKSPACE_ID not configured"}),
                 status_code=500,
-                mimetype="application/json"
+                mimetype="application/json",
             )
 
         body = req.get_json()
@@ -96,14 +124,18 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse(
                 json.dumps({"error": "Missing 'kql' in request body"}),
                 status_code=400,
-                mimetype="application/json"
+                mimetype="application/json",
             )
 
         max_rows = max(1, min(max_rows, MAX_ROWS))
         hours = parse_timespan_to_hours(timespan)
 
         if hours <= 0 or hours > MAX_HOURS:
-            raise ValueError("timespan exceeds max allowed window (24h)")
+            return func.HttpResponse(
+                json.dumps({"error": "timespan exceeds max allowed window (24h)"}),
+                status_code=400,
+                mimetype="application/json",
+            )
 
         kql_safety_check(kql)
         kql = ensure_take_limit(kql, max_rows)
@@ -111,27 +143,35 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         data = query_log_analytics(workspace_id, kql, timespan)
 
         return func.HttpResponse(
-            json.dumps({
-                "meta": {
-                    "timespan": timespan,
-                    "max_rows": max_rows,
-                    "note": "Bounded, Copilot-safe result"
-                },
-                "data": data
-            }),
+            json.dumps(
+                {
+                    "meta": {
+                        "timespan": timespan,
+                        "max_rows": max_rows,
+                        "note": "Bounded, Copilot-safe result",
+                    },
+                    "data": data,
+                }
+            ),
             status_code=200,
-            mimetype="application/json"
+            mimetype="application/json",
         )
 
     except urllib.error.HTTPError as e:
         return func.HttpResponse(
             e.read().decode("utf-8"),
             status_code=e.code,
-            mimetype="application/json"
+            mimetype="application/json",
+        )
+    except urllib.error.URLError as e:
+        return func.HttpResponse(
+            json.dumps({"error": f"url error: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json",
         )
     except Exception as e:
         return func.HttpResponse(
             json.dumps({"error": str(e)}),
             status_code=500,
-            mimetype="application/json"
+            mimetype="application/json",
         )
