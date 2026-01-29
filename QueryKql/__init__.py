@@ -18,11 +18,10 @@ def get_managed_identity_token() -> str:
     Managed Identity token without azure-identity.
     Prefer Functions/App Service identity endpoint if present; fallback to IMDS.
     """
-
-    # Functions/App Service endpoints (preferred)
     identity_endpoint = os.environ.get("IDENTITY_ENDPOINT") or os.environ.get("MSI_ENDPOINT")
     identity_header = os.environ.get("IDENTITY_HEADER") or os.environ.get("MSI_SECRET")
 
+    # Preferred: Functions/App Service identity endpoint
     if identity_endpoint and identity_header:
         sep = "&" if "?" in identity_endpoint else "?"
         url = f"{identity_endpoint}{sep}resource={LOG_ANALYTICS_RESOURCE}&api-version=2019-08-01"
@@ -35,24 +34,13 @@ def get_managed_identity_token() -> str:
             },
             method="GET",
         )
-
         with urllib.request.urlopen(req, timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8"))
             return payload["access_token"]
 
-    # Fallback: IMDS (may be blocked in some Azure Functions environments)
-    url = (
-        f"{IMDS_ENDPOINT}"
-        f"?api-version=2018-02-01"
-        f"&resource={LOG_ANALYTICS_RESOURCE}"
-    )
-
-    req = urllib.request.Request(
-        url,
-        headers={"Metadata": "true"},
-        method="GET",
-    )
-
+    # Fallback: IMDS (may be blocked in some environments)
+    url = f"{IMDS_ENDPOINT}?api-version=2018-02-01&resource={LOG_ANALYTICS_RESOURCE}"
+    req = urllib.request.Request(url, headers={"Metadata": "true"}, method="GET")
     with urllib.request.urlopen(req, timeout=10) as response:
         payload = json.loads(response.read().decode("utf-8"))
         return payload["access_token"]
@@ -67,7 +55,7 @@ def parse_timespan_to_hours(timespan: str) -> float:
     if d:
         return int(d.group(1)) * 24
 
-    raise ValueError("timespan must be PT#M, PT#H, or P#D")
+    raise ValueError("timespan must be PT#M, PT#H, or P#D (e.g., PT15M, PT1H, P1D)")
 
 
 def kql_safety_check(kql: str):
@@ -91,13 +79,17 @@ def query_log_analytics(workspace_id: str, kql: str, timespan: str) -> dict:
     url = f"https://api.loganalytics.io/v1/workspaces/{workspace_id}/query"
     payload = {"query": kql, "timespan": timespan}
 
+    # IMPORTANT: x-ms-app helps some tenants/workspaces with app-only queries
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "x-ms-app": "mcp-sentinel-gateway",
+    }
+
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
 
