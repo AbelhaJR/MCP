@@ -1,14 +1,7 @@
 import azure.functions as func
 import json
-import os
-
-EXPECTED_KEY = os.environ.get("MCP_API_KEY")
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    provided = req.headers.get("x-api-key")
-    if not EXPECTED_KEY or provided != EXPECTED_KEY:
-        return func.HttpResponse("Unauthorized", status_code=401)
-
     return func.HttpResponse(
         json.dumps({
             "tools": [
