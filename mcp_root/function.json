@@ -5,8 +5,8 @@
       "type": "httpTrigger",
       "direction": "in",
       "name": "req",
-      "methods": ["get"],
-      "route": "mcp/tools"
+      "methods": ["post"],
+      "route": ""
     },
     {
       "type": "http",
