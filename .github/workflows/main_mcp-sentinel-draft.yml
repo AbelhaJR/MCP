@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: 'MCP-main' # set this to the path to your web app project, defaults to the repository root
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: 'MCP' # set this to the path to your web app project, defaults to the repository root
   PYTHON_VERSION: '3.13' # set this to the python version to use (supports 3.6, 3.7, 3.8)
 
 jobs:
@@ -35,13 +35,13 @@ jobs:
           source venv/bin/activate
 
       - name: Install dependencies
-        run: pip install -r MCP-main/requirements.txt
+        run: pip install -r MCP/requirements.txt
 
       # Optional: Add step to run tests here
 
       - name: Zip artifact for deployment
         run: |
-          cd MCP-main
+          cd MCP
           zip ../release.zip ./* -r
 
       - name: Upload artifact for deployment job
@@ -78,4 +78,5 @@ jobs:
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_A7910988EBF64CA4AD382819EAA0E96A }}
           sku: 'flexconsumption'
         
+
 
