@@ -34,7 +34,6 @@ def rpc_ok(request_id: Any, result: Dict[str, Any]) -> func.HttpResponse:
         mimetype="application/json"
     )
 
-
 def rpc_err(request_id: Any, code: int, message: str, data: Optional[Dict[str, Any]] = None) -> func.HttpResponse:
     err = {"code": code, "message": message}
     if data:
@@ -72,10 +71,8 @@ def clamp_rows(n: Any) -> int:
 
 def kql_safety_check(kql: str):
     lowered = kql.lower()
-
     if re.fullmatch(r"\s*search\s+\*\s*", lowered):
         raise ValueError("KQL too broad: 'search *' not allowed")
-
     for blocked in ["externaldata", "evaluate", "make-series", "mv-expand"]:
         if blocked in lowered:
             raise ValueError(f"KQL contains blocked operator: {blocked}")
@@ -109,7 +106,6 @@ def get_managed_identity_token(resource: str) -> str:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode())["access_token"]
 
-    # IMDS fallback
     extra = f"&client_id={client_id}" if client_id else ""
     url = f"{IMDS_ENDPOINT}?api-version=2018-02-01&resource={resource}{extra}"
     req = urllib.request.Request(url, headers={"Metadata": "true"}, method="GET")
@@ -118,14 +114,12 @@ def get_managed_identity_token(resource: str) -> str:
         return json.loads(resp.read().decode())["access_token"]
 
 # ============================
-# Log Analytics Query
+# Log Analytics
 # ============================
 
 def la_query(workspace_id: str, kql: str, timespan: str, token: str) -> Dict[str, Any]:
     url = f"https://api.loganalytics.io/v1/workspaces/{workspace_id}/query"
-
     payload = {"query": kql, "timespan": timespan}
-
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
@@ -143,7 +137,6 @@ def la_query(workspace_id: str, kql: str, timespan: str, token: str) -> Dict[str
 
 def parse_la_error(e: urllib.error.HTTPError) -> Tuple[str, str, List[str]]:
     body_raw = e.read().decode("utf-8", errors="replace")
-
     try:
         body = json.loads(body_raw)
     except Exception:
@@ -174,16 +167,14 @@ def parse_la_error(e: urllib.error.HTTPError) -> Tuple[str, str, List[str]]:
     return error_type, message, suggestions
 
 # ============================
-# Tool Implementations
+# Tool Logic
 # ============================
 
 def run_query_tool(workspace_id, token, kql, timespan, max_rows):
     kql_safety_check(kql)
-
     hours = parse_timespan_to_hours(timespan)
     if hours <= 0 or hours > MAX_HOURS:
         raise ValueError("Timespan exceeds allowed window")
-
     kql = ensure_take_limit(kql, max_rows)
     return la_query(workspace_id, kql, timespan, token)
 
@@ -202,7 +193,7 @@ def preview_table_tool(workspace_id, token, table):
     return la_query(workspace_id, f"{table} | take 10", DEFAULT_TIMESPAN, token)
 
 # ============================
-# MCP Entry Point
+# MCP Entry
 # ============================
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
@@ -228,45 +219,47 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                             "type": "object",
                             "properties": {
                                 "kql": {"type": "string"},
-                                "timespan": {"type": "string", "default": "PT1H"},
-                                "max_rows": {"type": "integer", "default": 50}
+                                "timespan": {"type": "string"},
+                                "max_rows": {"type": "integer"}
                             },
-                            "required": ["kql"]
+                            "required": ["kql"],
+                            "additionalProperties": False
                         }
                     },
                     {
                         "name": "list_tables",
-                        "description": "List active tables in the workspace",
+                        "description": "List active tables in workspace",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "timespan": {
-                                    "type": "string",
-                                    "default": "PT1H"
-                                }
-                            }
+                                "timespan": {"type": "string"}
+                            },
+                            "required": [],
+                            "additionalProperties": False
                         }
                     },
                     {
                         "name": "get_table_schema",
-                        "description": "Get schema of a table",
+                        "description": "Get table schema",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "table": {"type": "string"}
                             },
-                            "required": ["table"]
+                            "required": ["table"],
+                            "additionalProperties": False
                         }
                     },
                     {
                         "name": "preview_table",
-                        "description": "Preview rows from a table",
+                        "description": "Preview rows from table",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "table": {"type": "string"}
                             },
-                            "required": ["table"]
+                            "required": ["table"],
+                            "additionalProperties": False
                         }
                     }
                 ]
