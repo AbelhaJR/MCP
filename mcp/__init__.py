@@ -151,10 +151,11 @@ def run_query_tool(workspace_id, token, kql, timespan, max_rows):
     return la_query(workspace_id, kql, timespan, token)
 
 def list_tables_tool(workspace_id, token, timespan):
-    kql = """
-    union withsource=TableName *
-    | summarize Count=count() by TableName
-    | top 200 by Count desc
+    kql = f"""
+    Usage
+    | where TimeGenerated > ago(24h)
+    | summarize Count=sum(Quantity) by DataType
+    | top 100 by Count desc
     """
     return la_query(workspace_id, kql, timespan, token)
 
@@ -279,3 +280,4 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         return rpc_err(None, -32000, str(e))
+
