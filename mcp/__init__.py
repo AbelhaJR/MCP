@@ -19,7 +19,6 @@ DEFAULT_ROWS = 50
 MAX_HOURS = 24
 DEFAULT_TIMESPAN = "PT1H"
 
-
 # ============================
 # JSON-RPC Helpers
 # ============================
@@ -50,7 +49,6 @@ def rpc_err(request_id: Any, code: int, message: str, data: Optional[Dict[str, A
         status_code=200,
         mimetype="application/json"
     )
-
 
 # ============================
 # Guardrails
@@ -88,7 +86,6 @@ def ensure_take_limit(kql: str, limit: int) -> str:
         return kql
     return f"{kql}\n| take {limit}"
 
-
 # ============================
 # Managed Identity
 # ============================
@@ -120,7 +117,6 @@ def get_managed_identity_token(resource: str) -> str:
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode())["access_token"]
 
-
 # ============================
 # Log Analytics Query
 # ============================
@@ -144,7 +140,6 @@ def la_query(workspace_id: str, kql: str, timespan: str, token: str) -> Dict[str
 
     with urllib.request.urlopen(req, timeout=25) as resp:
         return json.loads(resp.read().decode())
-
 
 def parse_la_error(e: urllib.error.HTTPError) -> Tuple[str, str, List[str]]:
     body_raw = e.read().decode("utf-8", errors="replace")
@@ -178,7 +173,6 @@ def parse_la_error(e: urllib.error.HTTPError) -> Tuple[str, str, List[str]]:
 
     return error_type, message, suggestions
 
-
 # ============================
 # Tool Implementations
 # ============================
@@ -193,23 +187,19 @@ def run_query_tool(workspace_id, token, kql, timespan, max_rows):
     kql = ensure_take_limit(kql, max_rows)
     return la_query(workspace_id, kql, timespan, token)
 
-
-def list_tables_tool(workspace_id, token):
+def list_tables_tool(workspace_id, token, timespan):
     kql = """
     union withsource=TableName *
     | summarize Count=count() by TableName
     | top 200 by Count desc
     """
-    return la_query(workspace_id, kql, "PT1H", token)
-
+    return la_query(workspace_id, kql, timespan, token)
 
 def get_schema_tool(workspace_id, token, table):
     return la_query(workspace_id, f"{table} | getschema", DEFAULT_TIMESPAN, token)
 
-
 def preview_table_tool(workspace_id, token, table):
     return la_query(workspace_id, f"{table} | take 10", DEFAULT_TIMESPAN, token)
-
 
 # ============================
 # MCP Entry Point
@@ -221,7 +211,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         request_id = body.get("id")
         method = body.get("method")
 
-        # Initialize
         if method == "initialize":
             return rpc_ok(request_id, {
                 "protocolVersion": "2024-11-05",
@@ -229,7 +218,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 "serverInfo": {"name": "sentinel-mcp-pro", "version": "1.0.0"}
             })
 
-        # Tools List (CRITICAL: FULL SCHEMA DEFINED)
         if method == "tools/list":
             return rpc_ok(request_id, {
                 "tools": [
@@ -248,10 +236,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     },
                     {
                         "name": "list_tables",
-                        "description": "List active tables",
+                        "description": "List active tables in the workspace",
                         "inputSchema": {
                             "type": "object",
-                            "properties": {}
+                            "properties": {
+                                "timespan": {
+                                    "type": "string",
+                                    "default": "PT1H"
+                                }
+                            }
                         }
                     },
                     {
@@ -279,11 +272,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 ]
             })
 
-        # Tools Call
         if method == "tools/call":
             params = body.get("params", {})
             tool_name = params.get("name")
-            args = params.get("arguments", {})
+            args = params.get("arguments", {}) or {}
 
             workspace_id = os.environ.get(WORKSPACE_ID_ENV)
             if not workspace_id:
@@ -302,13 +294,25 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     )
 
                 elif tool_name == "list_tables":
-                    result = list_tables_tool(workspace_id, token)
+                    result = list_tables_tool(
+                        workspace_id,
+                        token,
+                        args.get("timespan", DEFAULT_TIMESPAN)
+                    )
 
                 elif tool_name == "get_table_schema":
-                    result = get_schema_tool(workspace_id, token, args.get("table"))
+                    result = get_schema_tool(
+                        workspace_id,
+                        token,
+                        args.get("table")
+                    )
 
                 elif tool_name == "preview_table":
-                    result = preview_table_tool(workspace_id, token, args.get("table"))
+                    result = preview_table_tool(
+                        workspace_id,
+                        token,
+                        args.get("table")
+                    )
 
                 else:
                     return rpc_err(request_id, -32601, "Tool not found")
