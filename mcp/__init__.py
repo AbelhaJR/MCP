@@ -12,7 +12,6 @@ from typing import Dict, Any, Optional, Tuple, List
 
 IMDS_ENDPOINT = "http://169.254.169.254/metadata/identity/oauth2/token"
 LOG_ANALYTICS_RESOURCE = "https://api.loganalytics.io/"
-
 WORKSPACE_ID_ENV = "WORKSPACE_ID"
 
 MAX_ROWS_HARD = 200
@@ -26,40 +25,35 @@ DEFAULT_TIMESPAN = "PT1H"
 # ============================
 
 def rpc_ok(request_id: Any, result: Dict[str, Any]) -> func.HttpResponse:
-    payload = {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "result": result
-    }
     return func.HttpResponse(
-        json.dumps(payload, ensure_ascii=False),
+        json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result
+        }, ensure_ascii=False),
         status_code=200,
         mimetype="application/json"
     )
 
+
 def rpc_err(request_id: Any, code: int, message: str, data: Optional[Dict[str, Any]] = None) -> func.HttpResponse:
-    err: Dict[str, Any] = {
-        "code": code,
-        "message": message
-    }
+    err = {"code": code, "message": message}
     if data:
         err["data"] = data
 
-    payload = {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "error": err
-    }
-
     return func.HttpResponse(
-        json.dumps(payload, ensure_ascii=False),
+        json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": err
+        }, ensure_ascii=False),
         status_code=200,
         mimetype="application/json"
     )
 
 
 # ============================
-# Utility / Guardrails
+# Guardrails
 # ============================
 
 def parse_timespan_to_hours(timespan: str) -> float:
@@ -96,7 +90,7 @@ def ensure_take_limit(kql: str, limit: int) -> str:
 
 
 # ============================
-# Managed Identity Token
+# Managed Identity
 # ============================
 
 def get_managed_identity_token(resource: str) -> str:
@@ -134,10 +128,7 @@ def get_managed_identity_token(resource: str) -> str:
 def la_query(workspace_id: str, kql: str, timespan: str, token: str) -> Dict[str, Any]:
     url = f"https://api.loganalytics.io/v1/workspaces/{workspace_id}/query"
 
-    payload = {
-        "query": kql,
-        "timespan": timespan
-    }
+    payload = {"query": kql, "timespan": timespan}
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -173,15 +164,15 @@ def parse_la_error(e: urllib.error.HTTPError) -> Tuple[str, str, List[str]]:
 
     text = message.lower()
 
-    if "resolve table" in text or "unknown table" in text:
+    if "resolve table" in text:
         error_type = "TableNotFound"
         suggestions = ["Call list_tables", "Call preview_table"]
-    elif "resolve column" in text or "unknown column" in text:
+    elif "resolve column" in text:
         error_type = "ColumnNotFound"
         suggestions = ["Call get_table_schema", "Call preview_table"]
     elif "syntax" in text:
         error_type = "KqlSyntaxError"
-        suggestions = ["Simplify query", "Preview table first"]
+        suggestions = ["Simplify query and retry"]
     else:
         error_type = "BadRequest"
 
@@ -197,13 +188,10 @@ def run_query_tool(workspace_id, token, kql, timespan, max_rows):
 
     hours = parse_timespan_to_hours(timespan)
     if hours <= 0 or hours > MAX_HOURS:
-        raise ValueError("Timespan exceeds maximum allowed window")
+        raise ValueError("Timespan exceeds allowed window")
 
     kql = ensure_take_limit(kql, max_rows)
-
-    data = la_query(workspace_id, kql, timespan, token)
-
-    return data
+    return la_query(workspace_id, kql, timespan, token)
 
 
 def list_tables_tool(workspace_id, token):
@@ -216,13 +204,11 @@ def list_tables_tool(workspace_id, token):
 
 
 def get_schema_tool(workspace_id, token, table):
-    kql = f"{table} | getschema"
-    return la_query(workspace_id, kql, DEFAULT_TIMESPAN, token)
+    return la_query(workspace_id, f"{table} | getschema", DEFAULT_TIMESPAN, token)
 
 
 def preview_table_tool(workspace_id, token, table):
-    kql = f"{table} | take 10"
-    return la_query(workspace_id, kql, DEFAULT_TIMESPAN, token)
+    return la_query(workspace_id, f"{table} | take 10", DEFAULT_TIMESPAN, token)
 
 
 # ============================
@@ -235,6 +221,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         request_id = body.get("id")
         method = body.get("method")
 
+        # Initialize
         if method == "initialize":
             return rpc_ok(request_id, {
                 "protocolVersion": "2024-11-05",
@@ -242,16 +229,57 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 "serverInfo": {"name": "sentinel-mcp-pro", "version": "1.0.0"}
             })
 
+        # Tools List (CRITICAL: FULL SCHEMA DEFINED)
         if method == "tools/list":
             return rpc_ok(request_id, {
                 "tools": [
-                    {"name": "run_query"},
-                    {"name": "list_tables"},
-                    {"name": "get_table_schema"},
-                    {"name": "preview_table"}
+                    {
+                        "name": "run_query",
+                        "description": "Run a bounded KQL query",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "kql": {"type": "string"},
+                                "timespan": {"type": "string", "default": "PT1H"},
+                                "max_rows": {"type": "integer", "default": 50}
+                            },
+                            "required": ["kql"]
+                        }
+                    },
+                    {
+                        "name": "list_tables",
+                        "description": "List active tables",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "get_table_schema",
+                        "description": "Get schema of a table",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "table": {"type": "string"}
+                            },
+                            "required": ["table"]
+                        }
+                    },
+                    {
+                        "name": "preview_table",
+                        "description": "Preview rows from a table",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "table": {"type": "string"}
+                            },
+                            "required": ["table"]
+                        }
+                    }
                 ]
             })
 
+        # Tools Call
         if method == "tools/call":
             params = body.get("params", {})
             tool_name = params.get("name")
