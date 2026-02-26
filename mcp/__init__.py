@@ -71,8 +71,10 @@ def clamp_rows(n: Any) -> int:
 
 def kql_safety_check(kql: str):
     lowered = kql.lower()
+
     if re.fullmatch(r"\s*search\s+\*\s*", lowered):
         raise ValueError("KQL too broad: 'search *' not allowed")
+
     for blocked in ["externaldata", "evaluate", "make-series", "mv-expand"]:
         if blocked in lowered:
             raise ValueError(f"KQL contains blocked operator: {blocked}")
@@ -119,6 +121,7 @@ def get_managed_identity_token(resource: str) -> str:
 
 def la_query(workspace_id: str, kql: str, timespan: str, token: str) -> Dict[str, Any]:
     url = f"https://api.loganalytics.io/v1/workspaces/{workspace_id}/query"
+
     payload = {"query": kql, "timespan": timespan}
     headers = {
         "Authorization": f"Bearer {token}",
@@ -135,39 +138,8 @@ def la_query(workspace_id: str, kql: str, timespan: str, token: str) -> Dict[str
     with urllib.request.urlopen(req, timeout=25) as resp:
         return json.loads(resp.read().decode())
 
-def parse_la_error(e: urllib.error.HTTPError) -> Tuple[str, str, List[str]]:
-    body_raw = e.read().decode("utf-8", errors="replace")
-    try:
-        body = json.loads(body_raw)
-    except Exception:
-        body = {}
-
-    message = ""
-    error_type = "Unknown"
-    suggestions = []
-
-    if isinstance(body, dict):
-        err = body.get("error", {})
-        message = err.get("message", body_raw)
-
-    text = message.lower()
-
-    if "resolve table" in text:
-        error_type = "TableNotFound"
-        suggestions = ["Call list_tables", "Call preview_table"]
-    elif "resolve column" in text:
-        error_type = "ColumnNotFound"
-        suggestions = ["Call get_table_schema", "Call preview_table"]
-    elif "syntax" in text:
-        error_type = "KqlSyntaxError"
-        suggestions = ["Simplify query and retry"]
-    else:
-        error_type = "BadRequest"
-
-    return error_type, message, suggestions
-
 # ============================
-# Tool Logic
+# Tools
 # ============================
 
 def run_query_tool(workspace_id, token, kql, timespan, max_rows):
@@ -222,8 +194,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                 "timespan": {"type": "string"},
                                 "max_rows": {"type": "integer"}
                             },
-                            "required": ["kql"],
-                            "additionalProperties": False
+                            "required": ["kql"]
                         }
                     },
                     {
@@ -233,9 +204,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                             "type": "object",
                             "properties": {
                                 "timespan": {"type": "string"}
-                            },
-                            "required": [],
-                            "additionalProperties": False
+                            }
                         }
                     },
                     {
@@ -246,8 +215,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                             "properties": {
                                 "table": {"type": "string"}
                             },
-                            "required": ["table"],
-                            "additionalProperties": False
+                            "required": ["table"]
                         }
                     },
                     {
@@ -258,8 +226,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                             "properties": {
                                 "table": {"type": "string"}
                             },
-                            "required": ["table"],
-                            "additionalProperties": False
+                            "required": ["table"]
                         }
                     }
                 ]
@@ -276,53 +243,37 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
             token = get_managed_identity_token(LOG_ANALYTICS_RESOURCE)
 
-            try:
-                if tool_name == "run_query":
-                    result = run_query_tool(
-                        workspace_id,
-                        token,
-                        args.get("kql"),
-                        args.get("timespan", DEFAULT_TIMESPAN),
-                        clamp_rows(args.get("max_rows", DEFAULT_ROWS))
-                    )
+            if tool_name == "run_query":
+                result = run_query_tool(
+                    workspace_id,
+                    token,
+                    args.get("kql"),
+                    args.get("timespan", DEFAULT_TIMESPAN),
+                    clamp_rows(args.get("max_rows", DEFAULT_ROWS))
+                )
 
-                elif tool_name == "list_tables":
-                    result = list_tables_tool(
-                        workspace_id,
-                        token,
-                        args.get("timespan", DEFAULT_TIMESPAN)
-                    )
+            elif tool_name == "list_tables":
+                result = list_tables_tool(
+                    workspace_id,
+                    token,
+                    args.get("timespan", DEFAULT_TIMESPAN)
+                )
 
-                elif tool_name == "get_table_schema":
-                    result = get_schema_tool(
-                        workspace_id,
-                        token,
-                        args.get("table")
-                    )
+            elif tool_name == "get_table_schema":
+                result = get_schema_tool(workspace_id, token, args.get("table"))
 
-                elif tool_name == "preview_table":
-                    result = preview_table_tool(
-                        workspace_id,
-                        token,
-                        args.get("table")
-                    )
+            elif tool_name == "preview_table":
+                result = preview_table_tool(workspace_id, token, args.get("table"))
 
-                else:
-                    return rpc_err(request_id, -32601, "Tool not found")
+            else:
+                return rpc_err(request_id, -32601, "Tool not found")
 
-                return rpc_ok(request_id, {
-                    "content": [{
-                        "type": "text",
-                        "text": json.dumps(result, ensure_ascii=False, indent=2)
-                    }]
-                })
-
-            except urllib.error.HTTPError as e:
-                error_type, message, suggestions = parse_la_error(e)
-                return rpc_err(request_id, -32000, message, {
-                    "error_type": error_type,
-                    "suggestions": suggestions
-                })
+            return rpc_ok(request_id, {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(result, ensure_ascii=False, indent=2)
+                }]
+            })
 
         return rpc_err(request_id, -32601, "Method not found")
 
