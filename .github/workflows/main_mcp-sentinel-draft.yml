@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.13'   # MUST match Azure runtime version
 
 jobs:
   build:
@@ -24,22 +24,28 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # Install dependencies into Azure Functions folder structure
-      - name: Install dependencies into Azure package folder
+      # Install Azure-compatible Linux wheels
+      - name: Install dependencies for Azure Linux runtime
         run: |
           python -m pip install --upgrade pip
           mkdir -p .python_packages/lib/site-packages
-          pip install -r requirements.txt --target=.python_packages/lib/site-packages
+          pip install \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.13 \
+            --only-binary=:all: \
+            --target=.python_packages/lib/site-packages \
+            -r requirements.txt
 
-      # Create deployment zip (clean structure)
+      # Create clean deployment zip
       - name: Create deployment package
         run: |
-          zip -r release.zip . \
-            -x "venv/*" \
-            -x ".git/*" \
-            -x ".github/*" \
-            -x "__pycache__/*" \
-            -x "*.pyc"
+          zip -r release.zip \
+            function_app.py \
+            mcp_server.py \
+            host.json \
+            requirements.txt \
+            .python_packages
 
       # Upload artifact
       - name: Upload artifact
