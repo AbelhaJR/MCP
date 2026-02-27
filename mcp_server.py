@@ -132,13 +132,13 @@ def la_query(kql: str, timespan: str):
 @mcp.tool
 def list_tables(timespan: str = DEFAULT_TIMESPAN) -> dict:
     """
-    List active Log Analytics tables in the workspace.
+    List tables that have data in the selected timespan.
     """
+
     kql = """
-    Usage
-    | where TimeGenerated > ago(24h)
-    | summarize Count=sum(Quantity) by DataType
-    | top 100 by Count desc
+    union isfuzzy=true *
+    | summarize Count=count() by Type
+    | top 50 by Count desc
     """
 
     result = la_query(kql, timespan)
@@ -150,9 +150,8 @@ def list_tables(timespan: str = DEFAULT_TIMESPAN) -> dict:
     columns = [c["name"] for c in table["columns"]]
     rows = table["rows"]
 
-    # Find index of DataType column
     try:
-        idx = columns.index("DataType")
+        idx = columns.index("Type")
     except ValueError:
         return result
 
