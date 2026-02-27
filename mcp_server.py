@@ -132,18 +132,22 @@ def la_query(kql: str, timespan: str):
 @mcp.tool
 def list_tables(timespan: str = DEFAULT_TIMESPAN) -> dict:
     """
-    List tables that have data in the selected timespan.
+    List tables that ingested data within the given timespan.
+    Uses the Usage table (most reliable method).
     """
 
     kql = """
-    union isfuzzy=true *
-    | summarize Count=count() by Type
-    | top 50 by Count desc
+    Usage
+    | where Quantity > 0
+    | summarize Count=sum(Quantity) by DataType
+    | order by Count desc
+    | take 50
     """
 
     result = la_query(kql, timespan)
 
-    if "tables" not in result:
+    # If query failed, return raw result
+    if "tables" not in result or not result["tables"]:
         return result
 
     table = result["tables"][0]
@@ -151,7 +155,7 @@ def list_tables(timespan: str = DEFAULT_TIMESPAN) -> dict:
     rows = table["rows"]
 
     try:
-        idx = columns.index("Type")
+        idx = columns.index("DataType")
     except ValueError:
         return result
 
