@@ -140,7 +140,25 @@ def list_tables(timespan: str = DEFAULT_TIMESPAN) -> dict:
     | summarize Count=sum(Quantity) by DataType
     | top 100 by Count desc
     """
-    return la_query(kql, timespan)
+
+    result = la_query(kql, timespan)
+
+    if "tables" not in result:
+        return result
+
+    table = result["tables"][0]
+    columns = [c["name"] for c in table["columns"]]
+    rows = table["rows"]
+
+    # Find index of DataType column
+    try:
+        idx = columns.index("DataType")
+    except ValueError:
+        return result
+
+    return {
+        "tables": [row[idx] for row in rows]
+    }
 
 
 @mcp.tool
