@@ -35,7 +35,9 @@ jobs:
           source venv/bin/activate
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt --target="./.python_packages/lib/site-packages"
 
       # Optional: Add step to run tests here
 
@@ -75,6 +77,7 @@ jobs:
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_A7910988EBF64CA4AD382819EAA0E96A }}
           sku: 'flexconsumption'
         
+
 
 
 
