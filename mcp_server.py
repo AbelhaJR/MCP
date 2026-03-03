@@ -42,14 +42,16 @@ HTTP_TIMEOUT_SECONDS = int(os.environ.get("LA_HTTP_TIMEOUT", "15"))
 # ============================
 
 # Cache token briefly to avoid repeated MSI calls in short bursts
-_TOKEN_CACHE: Dict[str, Any] = {"token": None, "exp": 0}
+_TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def get_managed_identity_token(resource: str) -> str:
     now = int(time.time())
-    cached = _TOKEN_CACHE.get("token")
-    exp = int(_TOKEN_CACHE.get("exp") or 0)
-    if cached and exp - now > 60:
-        return cached
+
+    # Per-resource cache
+    cached = _TOKEN_CACHE.get(resource)
+    if cached:
+        if cached["exp"] - now > 60:
+            return cached["token"]
 
     identity_endpoint = os.environ.get("IDENTITY_ENDPOINT") or os.environ.get("MSI_ENDPOINT")
     identity_header = os.environ.get("IDENTITY_HEADER") or os.environ.get("MSI_SECRET")
@@ -70,8 +72,12 @@ def get_managed_identity_token(resource: str) -> str:
             payload = json.loads(resp.read().decode())
             token = payload["access_token"]
             expires_in = int(payload.get("expires_in") or 300)
-            _TOKEN_CACHE["token"] = token
-            _TOKEN_CACHE["exp"] = now + expires_in
+
+            _TOKEN_CACHE[resource] = {
+                "token": token,
+                "exp": now + expires_in,
+            }
+
             return token
 
     extra = f"&client_id={client_id}" if client_id else ""
@@ -82,8 +88,12 @@ def get_managed_identity_token(resource: str) -> str:
         payload = json.loads(resp.read().decode())
         token = payload["access_token"]
         expires_in = int(payload.get("expires_in") or 300)
-        _TOKEN_CACHE["token"] = token
-        _TOKEN_CACHE["exp"] = now + expires_in
+
+        _TOKEN_CACHE[resource] = {
+            "token": token,
+            "exp": now + expires_in,
+        }
+
         return token
 
 # ============================
