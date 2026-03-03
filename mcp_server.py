@@ -13,6 +13,55 @@ from typing import Any, Dict, List, Optional
 
 mcp = FastMCP("SentinelMCP")
 
+
+
+CONFLUENCE_TEMPLATE = """
+<p><strong>TYPE:</strong> USE CASE - <strong>SEVERITY:</strong> {severity}</p>
+<hr/>
+
+<h1>USE CASE SUMMARY</h1>
+<p><strong>Purpose</strong></p>
+<p>The purpose of this document is to describe the detection logic and implementation of the use case <strong>{rule_name}</strong>.</p>
+
+<hr/>
+
+<h1>Threat Layer</h1>
+
+<h2>MITRE ATT&CK</h2>
+<table>
+<tr><th>Tactic</th><th>Technique</th></tr>
+{mitre_rows}
+</table>
+
+<h2>Cyber Kill Chain</h2>
+<p>The use case primarily addresses the following phase:</p>
+<p><strong>{kill_chain_phase}</strong></p>
+
+<h2>References</h2>
+<ul>
+<li>Microsoft Sentinel analytic rule: {rule_name}</li>
+</ul>
+
+<hr/>
+
+<h1>Implementation Layer</h1>
+
+<h2>Log Sources</h2>
+<p>{tables}</p>
+
+<h2>Scope</h2>
+<p>This rule runs every {query_frequency} with a lookback of {query_period}.</p>
+
+<h2>Monitoring Rules</h2>
+<pre>{kql}</pre>
+
+<h2>Entities</h2>
+<ul>
+{entities}
+</ul>
+"""
+
+
 SUBSCRIPTION_ID = os.environ.get("SUBSCRIPTION_ID")
 RESOURCE_GROUP = os.environ.get("RESOURCE_GROUP")
 WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME")
@@ -844,6 +893,99 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
         "total_events": total_events,
         "risk_level": risk_level,
         "results": findings,
+    })
+
+
+_TOOL_DEFS.append(
+    {
+        "name": "generate_confluence_use_case",
+        "description": "Generate a Confluence-ready documentation page for a Sentinel analytic rule.",
+        "params": {
+            "rule_id": "optional: analytic rule ARM resource name/guid",
+            "rule_name": "optional: displayName match (case-insensitive exact match preferred)"
+        },
+    }
+)
+def _build_confluence_html(doc: dict) -> str:
+    mitre_rows = ""
+    tactics = doc.get("mitre_tactics", [])
+    techniques = doc.get("mitre_techniques", [])
+
+    if tactics:
+        for t in tactics:
+            mitre_rows += f"<tr><td>{t}</td><td></td></tr>"
+    else:
+        mitre_rows = "<tr><td>N/A</td><td>N/A</td></tr>"
+
+    entities_html = ""
+    for e in doc.get("kql", {}).get("entity_field_hints", []):
+        entities_html += f"<li>{e}</li>"
+    if not entities_html:
+        entities_html = "<li>N/A</li>"
+
+    tables = ", ".join(doc.get("kql", {}).get("tables_used", [])) or "Not detected"
+
+    return CONFLUENCE_TEMPLATE.format(
+        severity=doc.get("severity", "N/A"),
+        rule_name=doc.get("rule_display_name", "N/A"),
+        mitre_rows=mitre_rows,
+        kill_chain_phase="Detection / Command & Control",
+        tables=tables,
+        query_frequency=doc.get("schedule", {}).get("query_frequency", "N/A"),
+        query_period=doc.get("schedule", {}).get("query_period", "N/A"),
+        kql=doc.get("kql", {}).get("query", ""),
+        entities=entities_html,
+    )
+@mcp.tool
+def generate_confluence_use_case(
+    rule_id: Optional[str] = None,
+    rule_name: Optional[str] = None,
+) -> dict:
+
+    if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
+        return _fail("SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured")
+
+    rid = (rule_id or "").strip()
+    rname = (rule_name or "").strip()
+
+    if not rid and not rname:
+        return _fail("Provide rule_id or rule_name")
+
+    if not rid and rname:
+        rid = _find_rule_id_by_name(rname) or ""
+        if not rid:
+            return _fail("Rule not found by name")
+
+    res = _fetch_rule_by_id(rid)
+    if not res.get("ok"):
+        return res
+
+    rule = res["data"] or {}
+    props = rule.get("properties") or {}
+
+    kql = props.get("query") or ""
+
+    doc = {
+        "rule_display_name": props.get("displayName"),
+        "severity": props.get("severity"),
+        "mitre_tactics": props.get("tactics") or [],
+        "mitre_techniques": props.get("techniques") or [],
+        "schedule": {
+            "query_frequency": props.get("queryFrequency"),
+            "query_period": props.get("queryPeriod"),
+        },
+        "kql": {
+            "query": kql,
+            "tables_used": _extract_tables_from_kql(kql),
+            "entity_field_hints": _detect_entity_hints(kql),
+        },
+    }
+
+    html = _build_confluence_html(doc)
+
+    return _ok({
+        "rule_name": props.get("displayName"),
+        "confluence_html": html
     })
 # ============================
 # Export ASGI App (IMPORTANT)
