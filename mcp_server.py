@@ -13,6 +13,9 @@ from typing import Any, Dict, List, Optional
 
 mcp = FastMCP("SentinelMCP")
 
+SUBSCRIPTION_ID = os.environ.get("SUBSCRIPTION_ID")
+RESOURCE_GROUP = os.environ.get("RESOURCE_GROUP")
+WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME")
 # ============================
 # Configuration
 # ============================
