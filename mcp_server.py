@@ -344,7 +344,78 @@ def run_query(kql: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAUL
 
 ARM_RESOURCE = "https://management.azure.com/"
 
+def _extract_tables_from_kql(kql: str) -> List[str]:
+    if not kql:
+        return []
+    candidates = re.findall(r"(?m)^\s*([A-Za-z][A-Za-z0-9_]*)\s*\|", kql)
+    seen = set()
+    out = []
+    for t in candidates:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
+
+def _extract_ops_from_kql(kql: str) -> List[str]:
+    if not kql:
+        return []
+    ops = [
+        "where", "summarize", "join", "extend",
+        "project", "project-away", "parse",
+        "mv-expand", "evaluate", "union",
+        "lookup", "distinct"
+    ]
+    lowered = kql.lower()
+    return [op for op in ops if re.search(rf"\b{re.escape(op)}\b", lowered)]
+
+
+def _extract_threshold_snippets(kql: str) -> List[str]:
+    if not kql:
+        return []
+    matches = re.findall(
+        r"(?i)\bwhere\b[^\n]{0,140}?(?:>=|<=|==|!=|>|<)\s*\d+(?:\.\d+)?",
+        kql,
+    )
+    seen = set()
+    out = []
+    for m in matches:
+        m2 = " ".join(m.split())
+        if m2 not in seen:
+            seen.add(m2)
+            out.append(m2)
+        if len(out) >= 10:
+            break
+    return out
+
+
+def _detect_entity_hints(kql: str) -> List[str]:
+    if not kql:
+        return []
+    fields = [
+        "UserPrincipalName", "Account", "AccountName", "AadUserId",
+        "IPAddress", "IpAddress", "CallerIpAddress", "RemoteIP",
+        "DeviceName", "Computer", "HostName",
+        "FileName", "SHA256", "SHA1", "MD5",
+        "ProcessCommandLine", "CommandLine", "Url", "RemoteUrl"
+    ]
+    hits = []
+    for f in fields:
+        if re.search(rf"\b{re.escape(f)}\b", kql, re.IGNORECASE):
+            hits.append(f)
+    return hits[:20]
+
+
+def _kql_one_liner_summary(kql: str) -> str:
+    if not kql:
+        return ""
+    lines = [ln.strip() for ln in kql.splitlines() if ln.strip()]
+    head = lines[0] if lines else ""
+    ops = _extract_ops_from_kql(kql)
+    if ops:
+        return f"{head} (ops: {', '.join(ops[:8])})"
+    return head
+    
 def _arm_get(url: str) -> dict:
     try:
         token = get_managed_identity_token(ARM_RESOURCE)
