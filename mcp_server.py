@@ -389,12 +389,11 @@ _TOOL_DEFS.append(
     }
 )
 
-
 @mcp.tool
 def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAULT_ROWS) -> dict:
     """
-    SOC-style entity investigation across common Sentinel tables.
-    Returns structured summary of findings.
+    SOC-style entity investigation.
+    Copilot-safe version (no raw rows returned).
     """
 
     if not value:
@@ -413,9 +412,7 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
 
     entity_type = detect_entity_type(value)
     safe_value = escape_kql_string(value)
-    max_rows = clamp_rows(max_rows)
 
-    # Map entity types to relevant Sentinel tables
     table_map = {
         "ip": [
             ("SigninLogs", f'IPAddress == "{safe_value}"'),
@@ -431,37 +428,32 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
         ],
         "domain": [
             ("DeviceNetworkEvents", f'RemoteUrl contains "{safe_value}"'),
-            ("SigninLogs", f'AppDisplayName contains "{safe_value}"'),
         ],
         "sha256": [
             ("DeviceFileEvents", f'SHA256 == "{safe_value}"'),
-            ("DeviceProcessEvents", f'SHA256 == "{safe_value}"'),
-        ],
-        "sha1": [
-            ("DeviceFileEvents", f'SHA1 == "{safe_value}"'),
-            ("DeviceProcessEvents", f'SHA1 == "{safe_value}"'),
-        ],
-        "md5": [
-            ("DeviceFileEvents", f'MD5 == "{safe_value}"'),
         ],
         "generic": [
             ("SigninLogs", f'tostring(*) contains "{safe_value}"'),
         ],
     }
 
-    queries = table_map.get(entity_type, table_map["generic"])
+    queries = table_map.get(entity_type, table_map["generic"])[:5]
 
     findings = []
+    total_events = 0
+    risk_score = 0
 
     for table, where_clause in queries:
-        # Summary query
-        kql = f"""
+
+        summary_kql = f"""
         {table}
         | where {where_clause}
-        | summarize Count=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated)
+        | summarize Count=count(),
+                    FirstSeen=min(TimeGenerated),
+                    LastSeen=max(TimeGenerated)
         """
 
-        res = la_query(kql, timespan)
+        res = la_query(summary_kql, timespan)
         if not res.get("ok"):
             continue
 
@@ -475,38 +467,39 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
         if count == 0:
             continue
 
-        # Sample query
-        sample_kql = f"""
-        {table}
-        | where {where_clause}
-        | take {max_rows}
-        """
+        total_events += count
 
-        sample_res = la_query(sample_kql, timespan)
-        samples = []
-
-        if sample_res.get("ok"):
-            sample_tables = sample_res["data"].get("tables") or []
-            if sample_tables:
-                cols = [c["name"] for c in sample_tables[0].get("columns", [])]
-                for r in sample_tables[0].get("rows", []):
-                    samples.append(dict(zip(cols, r)))
+        # Simple SOC risk heuristics
+        if count > 100:
+            risk_score += 2
+        if table in ["SecurityEvent", "AuditLogs"]:
+            risk_score += 1
 
         findings.append({
             "table": table,
             "count": count,
             "first_seen": first_seen,
             "last_seen": last_seen,
-            "samples": samples,
         })
+
+    # Risk classification
+    if risk_score >= 4:
+        risk_level = "High"
+    elif risk_score >= 2:
+        risk_level = "Medium"
+    else:
+        risk_level = "Low"
 
     return _ok({
         "entity": value,
         "entity_type": entity_type,
         "timespan": timespan,
         "tables_hit": len(findings),
+        "total_events": total_events,
+        "risk_level": risk_level,
         "results": findings,
     })
+
 # ============================
 # Export ASGI App (IMPORTANT)
 # ============================
