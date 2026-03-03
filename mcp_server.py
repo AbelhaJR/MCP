@@ -501,6 +501,295 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
     })
 
 # ============================
+# Sentinel Analytics Rule (Use Case) Documentation Tools
+# ============================
+
+ARM_RESOURCE = "https://management.azure.com/"
+
+def _arm_get(url: str) -> dict:
+    """GET helper for Azure Resource Manager using Managed Identity."""
+    try:
+        token = get_managed_identity_token(ARM_RESOURCE)
+    except Exception as e:
+        return _fail("Failed to acquire ARM token", detail=str(e))
+
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=HTTP_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        return _fail("HTTP request to ARM failed", detail=str(e))
+
+    if not resp.ok:
+        return _fail("ARM request failed", status_code=resp.status_code, detail=resp.text)
+
+    try:
+        return _ok(resp.json())
+    except Exception as e:
+        return _fail("Failed to parse ARM JSON response", detail=str(e))
+
+
+def _sentinel_rules_base_url(subscription_id: str, resource_group: str, workspace_name: str) -> str:
+    # Sentinel is under the Log Analytics workspace provider tree:
+    # .../providers/Microsoft.OperationalInsights/workspaces/{workspace}/providers/Microsoft.SecurityInsights/alertRules
+    return (
+        f"https://management.azure.com/subscriptions/{subscription_id}"
+        f"/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.OperationalInsights/workspaces/{workspace_name}"
+        f"/providers/Microsoft.SecurityInsights/alertRules"
+    )
+
+
+def _extract_tables_from_kql(kql: str) -> List[str]:
+    """
+    Heuristic: grab identifiers that appear at the start of a line before a pipe.
+    This catches common 'TableName | ...' patterns.
+    """
+    if not kql:
+        return []
+    candidates = re.findall(r"(?m)^\s*([A-Za-z][A-Za-z0-9_]*)\s*\|", kql)
+    # de-dupe while preserving order
+    seen = set()
+    out = []
+    for t in candidates:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _extract_ops_from_kql(kql: str) -> List[str]:
+    if not kql:
+        return []
+    ops = ["where", "summarize", "join", "extend", "project", "project-away", "parse", "mv-expand", "evaluate", "union", "lookup", "distinct"]
+    lowered = kql.lower()
+    used = [op for op in ops if re.search(rf"(?i)\b{re.escape(op)}\b", lowered)]
+    return used
+
+
+def _extract_threshold_snippets(kql: str) -> List[str]:
+    """
+    Pull small 'where ... > N' / '>= N' patterns as doc hints.
+    Keep it compact.
+    """
+    if not kql:
+        return []
+    matches = re.findall(r"(?i)\bwhere\b[^\n]{0,140}?(?:>=|<=|==|!=|>|<)\s*\d+(?:\.\d+)?", kql)
+    # de-dupe and limit
+    out = []
+    seen = set()
+    for m in matches:
+        m2 = " ".join(m.split())
+        if m2 not in seen:
+            seen.add(m2)
+            out.append(m2)
+        if len(out) >= 10:
+            break
+    return out
+
+
+def _detect_entity_hints(kql: str) -> List[str]:
+    """
+    Best-effort entity field hints for documentation.
+    """
+    if not kql:
+        return []
+    fields = [
+        "UserPrincipalName", "Account", "AccountName", "AadUserId",
+        "IPAddress", "IpAddress", "CallerIpAddress", "RemoteIP",
+        "DeviceName", "Computer", "HostName",
+        "FileName", "SHA256", "SHA1", "MD5",
+        "ProcessCommandLine", "CommandLine", "Url", "RemoteUrl"
+    ]
+    hits = []
+    for f in fields:
+        if re.search(rf"(?i)\b{re.escape(f)}\b", kql):
+            hits.append(f)
+    return hits[:20]
+
+
+def _kql_one_liner_summary(kql: str) -> str:
+    """
+    Tiny summary: first non-empty line + key operators.
+    """
+    if not kql:
+        return ""
+    lines = [ln.strip() for ln in kql.splitlines() if ln.strip()]
+    head = lines[0] if lines else ""
+    ops = _extract_ops_from_kql(kql)
+    if ops:
+        return f"{head} (ops: {', '.join(ops[:8])})"
+    return head
+
+
+# ---- Add tools to inventory ----
+_TOOL_DEFS.append(
+    {
+        "name": "list_analytics_rules",
+        "description": "Lists Microsoft Sentinel analytics rules (custom + built-in) in a workspace. Use to discover rule names and IDs.",
+        "params": {
+            "subscription_id": "Azure subscription id",
+            "resource_group": "Azure resource group name",
+            "workspace_name": "Log Analytics workspace name",
+            "top": "optional int; max rules to return (default 50, hard cap 200)"
+        },
+    }
+)
+
+_TOOL_DEFS.append(
+    {
+        "name": "analyze_use_case",
+        "description": "Fetches a Sentinel analytic rule (by rule_id or rule_name), extracts its KQL and returns documentation-ready key points (tables, ops, thresholds, entities, schedule, MITRE, severity).",
+        "params": {
+            "subscription_id": "Azure subscription id",
+            "resource_group": "Azure resource group name",
+            "workspace_name": "Log Analytics workspace name",
+            "rule_id": "optional: analytic rule ARM resource name/guid",
+            "rule_name": "optional: displayName match (case-insensitive exact match preferred)",
+        },
+    }
+)
+
+
+@mcp.tool
+def list_analytics_rules(subscription_id: str, resource_group: str, workspace_name: str, top: int = 50) -> dict:
+    if not subscription_id or not resource_group or not workspace_name:
+        return _fail("subscription_id, resource_group, and workspace_name are required")
+
+    try:
+        top_i = int(top)
+    except Exception:
+        top_i = 50
+    top_i = max(1, min(top_i, 200))
+
+    base = _sentinel_rules_base_url(subscription_id, resource_group, workspace_name)
+    # API version commonly used for Sentinel alertRules
+    url = f"{base}?api-version=2023-02-01-preview"
+
+    res = _arm_get(url)
+    if not res.get("ok"):
+        return res
+
+    items = (res["data"].get("value") or [])
+    out = []
+    for it in items[:top_i]:
+        props = it.get("properties") or {}
+        out.append({
+            "rule_id": it.get("name"),
+            "display_name": props.get("displayName"),
+            "kind": it.get("kind"),
+            "enabled": props.get("enabled"),
+            "severity": props.get("severity"),
+        })
+
+    return _ok({"count": len(out), "rules": out})
+
+
+def _fetch_rule_by_id(subscription_id: str, resource_group: str, workspace_name: str, rule_id: str) -> dict:
+    base = _sentinel_rules_base_url(subscription_id, resource_group, workspace_name)
+    url = f"{base}/{rule_id}?api-version=2023-02-01-preview"
+    return _arm_get(url)
+
+
+def _find_rule_id_by_name(subscription_id: str, resource_group: str, workspace_name: str, rule_name: str) -> Optional[str]:
+    # Fetch list (bounded) and match by displayName
+    base = _sentinel_rules_base_url(subscription_id, resource_group, workspace_name)
+    url = f"{base}?api-version=2023-02-01-preview"
+    res = _arm_get(url)
+    if not res.get("ok"):
+        return None
+    target = (rule_name or "").strip().lower()
+    for it in (res["data"].get("value") or []):
+        props = it.get("properties") or {}
+        dn = (props.get("displayName") or "").strip().lower()
+        if dn == target:
+            return it.get("name")
+    return None
+
+
+@mcp.tool
+def analyze_use_case(
+    subscription_id: str,
+    resource_group: str,
+    workspace_name: str,
+    rule_id: Optional[str] = None,
+    rule_name: Optional[str] = None,
+) -> dict:
+    if not subscription_id or not resource_group or not workspace_name:
+        return _fail("subscription_id, resource_group, and workspace_name are required")
+
+    rid = (rule_id or "").strip()
+    rname = (rule_name or "").strip()
+
+    if not rid and not rname:
+        return _fail("Provide rule_id or rule_name")
+
+    if not rid and rname:
+        rid = _find_rule_id_by_name(subscription_id, resource_group, workspace_name, rname) or ""
+        if not rid:
+            return _fail("Rule not found by name", detail="Try list_analytics_rules and pass rule_id")
+
+    res = _fetch_rule_by_id(subscription_id, resource_group, workspace_name, rid)
+    if not res.get("ok"):
+        return res
+
+    rule = res["data"] or {}
+    props = rule.get("properties") or {}
+
+    kql = props.get("query") or ""
+    tables = _extract_tables_from_kql(kql)
+    ops = _extract_ops_from_kql(kql)
+    thresholds = _extract_threshold_snippets(kql)
+    entities = _detect_entity_hints(kql)
+
+    # Common doc fields
+    doc = {
+        "rule_id": rule.get("name"),
+        "rule_display_name": props.get("displayName"),
+        "description": props.get("description"),
+        "severity": props.get("severity"),
+        "enabled": props.get("enabled"),
+        "kind": rule.get("kind"),
+        "mitre_tactics": props.get("tactics") or [],
+        "mitre_techniques": props.get("techniques") or [],
+        "schedule": {
+            "query_frequency": props.get("queryFrequency"),
+            "query_period": props.get("queryPeriod"),
+        },
+        "trigger": {
+            "operator": props.get("triggerOperator"),
+            "threshold": props.get("triggerThreshold"),
+        },
+        "kql": {
+            # keep KQL, but bounded to avoid token explosions
+            "query": kql[:12000],  # hard cap; adjust if needed
+            "summary": _kql_one_liner_summary(kql),
+            "tables_used": tables[:25],
+            "operators_used": ops,
+            "threshold_hints": thresholds,
+            "entity_field_hints": entities,
+        },
+        "documentation_key_points": [
+            "Data sources / tables: " + (", ".join(tables[:10]) if tables else "Not detected (check KQL)"),
+            "Core logic operators: " + (", ".join(ops) if ops else "Not detected (check KQL)"),
+            "Threshold indicators: " + (("; ".join(thresholds[:5])) if thresholds else "None detected"),
+            "Entity fields observed: " + (", ".join(entities[:10]) if entities else "None detected"),
+            "Schedule: frequency="
+            + str(props.get("queryFrequency"))
+            + ", lookback="
+            + str(props.get("queryPeriod")),
+            "MITRE mapping: tactics="
+            + (", ".join(props.get("tactics") or []) or "None")
+            + "; techniques="
+            + (", ".join(props.get("techniques") or []) or "None"),
+            "Tuning guidance: validate false positives by adjusting thresholds, adding allowlists, and tightening filters on noisy fields (e.g., service accounts, known admin IP ranges).",
+        ],
+    }
+
+    return _ok(doc)
+# ============================
 # Export ASGI App (IMPORTANT)
 # ============================
 
