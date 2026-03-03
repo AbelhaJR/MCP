@@ -202,29 +202,6 @@ def la_query(kql: str, timespan: str) -> dict:
         return _fail("Failed to parse Log Analytics JSON response", detail=str(e), timespan=timespan)
 
 # ============================
-# Entity Detection
-# ============================
-
-def escape_kql_string(s: str) -> str:
-    return (s or "").replace('"', '""')
-
-def detect_entity_type(value: str) -> str:
-    v = (value or "").strip()
-
-    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", v):
-        return "ip"
-
-    if "@" in v:
-        return "user"
-
-    if re.fullmatch(r"[a-fA-F0-9]{64}", v):
-        return "sha256"
-
-    if "." in v:
-        return "domain"
-
-    return "generic"
-# ============================
 # Tool inventory (do NOT rely on LLM memory)
 # ============================
 
@@ -259,9 +236,6 @@ _TOOL_DEFS: List[dict] = [
         "description": "Runs a bounded KQL query for the given timespan and returns up to max_rows rows.",
         "params": {"kql": "KQL string", "timespan": "ISO8601 duration", "max_rows": "integer <= 200"},
     },
-    {"name": "analyze_entity",
-     "description": "SOC-style entity analysis across common Sentinel tables",
-     "params": {"value": "Entity string", "timespan": "ISO8601 duration", "max_rows": "integer <= 200"}}
 ]
 
 @mcp.tool
@@ -691,6 +665,183 @@ def analyze_use_case(
     }
 
     return _ok(doc)
+
+
+# ============================
+# Advanced SOC Entity Analysis Tool
+# ============================
+
+MAX_HOURS_ANALYZE_ENTITY = 168  # 7 days max window
+
+
+def escape_kql_string(s: str) -> str:
+    """Escape quotes for safe KQL usage."""
+    return (s or "").replace('"', '""')
+
+
+def detect_entity_type(value: str) -> str:
+    """Basic entity classification."""
+    v = (value or "").strip()
+
+    # IPv4
+    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", v):
+        try:
+            parts = [int(x) for x in v.split(".")]
+            if all(0 <= p <= 255 for p in parts):
+                return "ip"
+        except Exception:
+            pass
+
+    # User (UPN / email)
+    if "@" in v:
+        return "user"
+
+    # Hashes
+    if re.fullmatch(r"[a-fA-F0-9]{64}", v):
+        return "sha256"
+    if re.fullmatch(r"[a-fA-F0-9]{40}", v):
+        return "sha1"
+    if re.fullmatch(r"[a-fA-F0-9]{32}", v):
+        return "md5"
+
+    # Domain
+    if "." in v:
+        return "domain"
+
+    return "generic"
+
+
+# Add tool to inventory
+_TOOL_DEFS.append(
+    {
+        "name": "analyze_entity",
+        "description": "SOC-style entity investigation across common Sentinel tables. Supports ip, user, host, domain, hash.",
+        "params": {
+            "value": "Entity string (IP, UPN, hostname, domain, hash, etc.)",
+            "timespan": "ISO8601 duration (PT6H, P1D, P7D)",
+            "max_rows": "integer <= 200"
+        },
+    }
+)
+
+
+@mcp.tool
+def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAULT_ROWS) -> dict:
+    """
+    SOC-style entity investigation across common Sentinel tables.
+    Returns structured summary of findings.
+    """
+
+    if not value:
+        return _fail("value is required")
+
+    try:
+        hours = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid timespan", detail=str(e))
+
+    if hours <= 0 or hours > MAX_HOURS_ANALYZE_ENTITY:
+        return _fail(
+            f"Timespan exceeds allowed window ({MAX_HOURS_ANALYZE_ENTITY}h max)",
+            detail=f"got {hours}h"
+        )
+
+    entity_type = detect_entity_type(value)
+    safe_value = escape_kql_string(value)
+    max_rows = clamp_rows(max_rows)
+
+    # Map entity types to relevant Sentinel tables
+    table_map = {
+        "ip": [
+            ("SigninLogs", f'IPAddress == "{safe_value}"'),
+            ("SecurityEvent", f'IpAddress == "{safe_value}"'),
+            ("AzureActivity", f'CallerIpAddress == "{safe_value}"'),
+            ("DeviceNetworkEvents", f'RemoteIP == "{safe_value}"'),
+        ],
+        "user": [
+            ("SigninLogs", f'UserPrincipalName =~ "{safe_value}"'),
+            ("SecurityEvent", f'Account =~ "{safe_value}"'),
+            ("AuditLogs", f'tostring(InitiatedBy.user.userPrincipalName) =~ "{safe_value}"'),
+            ("DeviceLogonEvents", f'AccountName =~ "{safe_value}"'),
+        ],
+        "domain": [
+            ("DeviceNetworkEvents", f'RemoteUrl contains "{safe_value}"'),
+            ("SigninLogs", f'AppDisplayName contains "{safe_value}"'),
+        ],
+        "sha256": [
+            ("DeviceFileEvents", f'SHA256 == "{safe_value}"'),
+            ("DeviceProcessEvents", f'SHA256 == "{safe_value}"'),
+        ],
+        "sha1": [
+            ("DeviceFileEvents", f'SHA1 == "{safe_value}"'),
+            ("DeviceProcessEvents", f'SHA1 == "{safe_value}"'),
+        ],
+        "md5": [
+            ("DeviceFileEvents", f'MD5 == "{safe_value}"'),
+        ],
+        "generic": [
+            ("SigninLogs", f'tostring(*) contains "{safe_value}"'),
+        ],
+    }
+
+    queries = table_map.get(entity_type, table_map["generic"])
+
+    findings = []
+
+    for table, where_clause in queries:
+        # Summary query
+        kql = f"""
+        {table}
+        | where {where_clause}
+        | summarize Count=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated)
+        """
+
+        res = la_query(kql, timespan)
+        if not res.get("ok"):
+            continue
+
+        tables = res["data"].get("tables") or []
+        if not tables or not tables[0].get("rows"):
+            continue
+
+        row = tables[0]["rows"][0]
+        count, first_seen, last_seen = row
+
+        if count == 0:
+            continue
+
+        # Sample query
+        sample_kql = f"""
+        {table}
+        | where {where_clause}
+        | take {max_rows}
+        """
+
+        sample_res = la_query(sample_kql, timespan)
+        samples = []
+
+        if sample_res.get("ok"):
+            sample_tables = sample_res["data"].get("tables") or []
+            if sample_tables:
+                cols = [c["name"] for c in sample_tables[0].get("columns", [])]
+                for r in sample_tables[0].get("rows", []):
+                    samples.append(dict(zip(cols, r)))
+
+        findings.append({
+            "table": table,
+            "count": count,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "samples": samples,
+        })
+
+    return _ok({
+        "entity": value,
+        "entity_type": entity_type,
+        "timespan": timespan,
+        "tables_hit": len(findings),
+        "results": findings,
+    })
 # ============================
 # Export ASGI App (IMPORTANT)
 # ============================
