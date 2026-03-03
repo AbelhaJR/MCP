@@ -202,6 +202,29 @@ def la_query(kql: str, timespan: str) -> dict:
         return _fail("Failed to parse Log Analytics JSON response", detail=str(e), timespan=timespan)
 
 # ============================
+# Entity Detection
+# ============================
+
+def escape_kql_string(s: str) -> str:
+    return (s or "").replace('"', '""')
+
+def detect_entity_type(value: str) -> str:
+    v = (value or "").strip()
+
+    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", v):
+        return "ip"
+
+    if "@" in v:
+        return "user"
+
+    if re.fullmatch(r"[a-fA-F0-9]{64}", v):
+        return "sha256"
+
+    if "." in v:
+        return "domain"
+
+    return "generic"
+# ============================
 # Tool inventory (do NOT rely on LLM memory)
 # ============================
 
@@ -236,6 +259,9 @@ _TOOL_DEFS: List[dict] = [
         "description": "Runs a bounded KQL query for the given timespan and returns up to max_rows rows.",
         "params": {"kql": "KQL string", "timespan": "ISO8601 duration", "max_rows": "integer <= 200"},
     },
+    {"name": "analyze_entity",
+     "description": "SOC-style entity analysis across common Sentinel tables",
+     "params": {"value": "Entity string", "timespan": "ISO8601 duration", "max_rows": "integer <= 200"}}
 ]
 
 @mcp.tool
@@ -257,6 +283,75 @@ def ping() -> dict:
 # ============================
 # Tools
 # ============================
+@mcp.tool
+def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAULT_ROWS) -> dict:
+
+    if not value:
+        return _fail("value is required")
+
+    hours = parse_timespan_to_hours(timespan)
+    if hours > MAX_HOURS_ANALYZE_ENTITY:
+        return _fail(f"Timespan exceeds allowed window ({MAX_HOURS_ANALYZE_ENTITY}h max)")
+
+    entity_type = detect_entity_type(value)
+    safe_value = escape_kql_string(value)
+    max_rows = clamp_rows(max_rows)
+
+    table_map = {
+        "ip": [
+            ("SigninLogs", f'IPAddress == "{safe_value}"'),
+            ("SecurityEvent", f'IpAddress == "{safe_value}"'),
+            ("AzureActivity", f'CallerIpAddress == "{safe_value}"'),
+        ],
+        "user": [
+            ("SigninLogs", f'UserPrincipalName =~ "{safe_value}"'),
+            ("SecurityEvent", f'Account =~ "{safe_value}"'),
+            ("AuditLogs", f'tostring(InitiatedBy.user.userPrincipalName) =~ "{safe_value}"'),
+        ],
+        "domain": [
+            ("DeviceNetworkEvents", f'RemoteUrl contains "{safe_value}"'),
+        ],
+        "generic": [
+            ("SigninLogs", f'tostring(*) contains "{safe_value}"'),
+        ]
+    }
+
+    queries = table_map.get(entity_type, table_map["generic"])
+
+    report = []
+
+    for table, where_clause in queries:
+        kql = f"""
+        {table}
+        | where {where_clause}
+        | summarize Count=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated)
+        """
+
+        res = la_query(kql, timespan)
+        if not res.get("ok"):
+            continue
+
+        tables = res["data"].get("tables") or []
+        if not tables or not tables[0].get("rows"):
+            continue
+
+        row = tables[0]["rows"][0]
+        if row[0] == 0:
+            continue
+
+        report.append({
+            "table": table,
+            "count": row[0],
+            "first_seen": row[1],
+            "last_seen": row[2]
+        })
+
+    return _ok({
+        "entity": value,
+        "entity_type": entity_type,
+        "timespan": timespan,
+        "results": report
+    })
 
 @mcp.tool
 def list_tables(timespan: str = DEFAULT_TIMESPAN) -> dict:
