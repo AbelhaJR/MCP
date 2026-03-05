@@ -1143,6 +1143,207 @@ SecurityIncident
         "last_alert": incident.get("LastAlert"),
         "risk_level": risk
     })
+
+
+_TOOL_DEFS.append(
+    {
+        "name": "investigate_incident",
+        "description": "SOC investigation of a Microsoft Sentinel incident. Extracts alerts, entities, timeline, and risk indicators.",
+        "params": {
+            "incident_id": "Sentinel incident number",
+            "timespan": "ISO8601 duration (P1D, P7D)"
+        },
+    }
+)
+@mcp.tool
+def investigate_incident(incident_id: str, timespan: str = "P7D") -> dict:
+    """
+    SOC-style Sentinel incident investigation.
+    Extracts alerts, entities, and timeline indicators.
+    """
+
+    if not incident_id:
+        return _fail("incident_id is required")
+
+    try:
+        _ = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid timespan", detail=str(e))
+
+    safe_id = escape_kql_string(str(incident_id))
+
+    # -----------------------------------
+    # Step 1 — Incident metadata
+    # -----------------------------------
+
+    incident_kql = f"""
+SecurityIncident
+| where IncidentNumber == {safe_id} or IncidentName =~ "{safe_id}"
+| project
+    IncidentNumber,
+    Title,
+    Severity,
+    Status,
+    Owner,
+    CreatedTime,
+    LastModifiedTime,
+    AlertIds
+"""
+
+    inc_res = la_query(incident_kql, timespan)
+
+    if not inc_res.get("ok"):
+        return inc_res
+
+    tables = inc_res["data"].get("tables") or []
+    if not tables or not tables[0]["rows"]:
+        return _fail("Incident not found")
+
+    cols = [c["name"] for c in tables[0]["columns"]]
+    row = tables[0]["rows"][0]
+
+    incident = dict(zip(cols, row))
+
+    alert_ids = incident.get("AlertIds") or []
+
+    if not alert_ids:
+        return _ok({
+            "incident": incident,
+            "alerts": [],
+            "entities": {},
+            "assessment": "Incident has no linked alerts"
+        })
+
+    alert_list = ",".join([f'"{escape_kql_string(a)}"' for a in alert_ids])
+
+    # -----------------------------------
+    # Step 2 — Alerts investigation
+    # -----------------------------------
+
+    alerts_kql = f"""
+SecurityAlert
+| where SystemAlertId in ({alert_list}) or AlertId in ({alert_list})
+| project
+    AlertName = DisplayName,
+    Severity,
+    TimeGenerated,
+    ProviderName,
+    Entities
+"""
+
+    alert_res = la_query(alerts_kql, timespan)
+
+    if not alert_res.get("ok"):
+        return alert_res
+
+    tables = alert_res["data"].get("tables") or []
+    if not tables:
+        alerts = []
+    else:
+        cols = [c["name"] for c in tables[0]["columns"]]
+        alerts = [dict(zip(cols, r)) for r in tables[0]["rows"]]
+
+    # -----------------------------------
+    # Step 3 — Extract entities
+    # -----------------------------------
+
+    users = set()
+    ips = set()
+    hosts = set()
+
+    for alert in alerts:
+        entities = alert.get("Entities")
+
+        if not entities:
+            continue
+
+        try:
+            ent_list = json.loads(entities)
+        except Exception:
+            continue
+
+        for e in ent_list:
+
+            etype = (e.get("Type") or "").lower()
+
+            if etype == "account":
+                users.add(e.get("Name"))
+
+            if etype == "ip":
+                ips.add(e.get("Address"))
+
+            if etype in ["host", "machine"]:
+                hosts.add(e.get("HostName"))
+
+    # -----------------------------------
+    # Step 4 — Timeline
+    # -----------------------------------
+
+    alert_times = [a.get("TimeGenerated") for a in alerts if a.get("TimeGenerated")]
+
+    first_alert = min(alert_times) if alert_times else None
+    last_alert = max(alert_times) if alert_times else None
+
+    # -----------------------------------
+    # Step 5 — Risk heuristic
+    # -----------------------------------
+
+    risk_score = 0
+
+    sev = (incident.get("Severity") or "").lower()
+
+    if sev == "high":
+        risk_score += 3
+    elif sev == "medium":
+        risk_score += 2
+    else:
+        risk_score += 1
+
+    if len(alerts) > 5:
+        risk_score += 2
+
+    if ips:
+        risk_score += 1
+
+    if users:
+        risk_score += 1
+
+    if risk_score >= 6:
+        risk_level = "High"
+    elif risk_score >= 3:
+        risk_level = "Medium"
+    else:
+        risk_level = "Low"
+
+    # -----------------------------------
+    # Final SOC Report
+    # -----------------------------------
+
+    return _ok({
+        "incident": {
+            "id": incident.get("IncidentNumber"),
+            "title": incident.get("Title"),
+            "severity": incident.get("Severity"),
+            "status": incident.get("Status"),
+            "owner": incident.get("Owner"),
+            "created_time": incident.get("CreatedTime"),
+        },
+        "alerts": {
+            "count": len(alerts),
+            "names": list({a.get("AlertName") for a in alerts}),
+            "providers": list({a.get("ProviderName") for a in alerts}),
+        },
+        "entities": {
+            "users": list(users),
+            "ips": list(ips),
+            "hosts": list(hosts),
+        },
+        "timeline": {
+            "first_alert": first_alert,
+            "last_alert": last_alert,
+        },
+        "risk_level": risk_level,
+    })
 # ============================
 # Export ASGI App (IMPORTANT)
 # ============================
