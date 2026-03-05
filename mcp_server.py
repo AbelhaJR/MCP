@@ -987,6 +987,162 @@ def generate_confluence_use_case(
         "rule_name": props.get("displayName"),
         "confluence_html": html
     })
+
+_TOOL_DEFS.append(
+    {
+        "name": "get_incident_report",
+        "description": "List Sentinel incidents or generate a SOC incident report. If incident_id is omitted, returns recent incidents.",
+        "params": {
+            "incident_id": "optional: Sentinel incident number or name",
+            "timespan": "ISO8601 duration like P1D, P7D",
+            "top": "optional number of incidents to list (default 10)"
+        },
+    }
+)
+@mcp.tool
+def get_incident_report(
+    incident_id: Optional[str] = None,
+    timespan: str = "P7D",
+    top: int = 10
+) -> dict:
+    """
+    If incident_id is not provided → list recent incidents.
+    If incident_id is provided → return detailed incident report.
+    """
+
+    try:
+        _ = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid timespan", detail=str(e))
+
+    top = clamp_rows(top)
+
+    # --------------------------------
+    # MODE 1 — LIST INCIDENTS
+    # --------------------------------
+    if not incident_id:
+
+        kql = f"""
+SecurityIncident
+| sort by CreatedTime desc
+| project
+    IncidentNumber,
+    Title,
+    Severity,
+    Status,
+    Owner,
+    CreatedTime,
+    LastModifiedTime
+| take {top}
+"""
+
+        res = la_query(kql, timespan)
+
+        if not res.get("ok"):
+            return res
+
+        tables = res["data"].get("tables") or []
+        if not tables:
+            return _fail("No incidents found")
+
+        cols = [c["name"] for c in tables[0]["columns"]]
+
+        incidents = [
+            dict(zip(cols, r))
+            for r in tables[0]["rows"]
+        ]
+
+        return _ok({
+            "mode": "list",
+            "count": len(incidents),
+            "incidents": incidents
+        })
+
+    # --------------------------------
+    # MODE 2 — INCIDENT REPORT
+    # --------------------------------
+
+    safe_id = escape_kql_string(str(incident_id))
+
+    kql = f"""
+SecurityIncident
+| where IncidentNumber == {safe_id} or IncidentName =~ "{safe_id}"
+| project
+    IncidentNumber,
+    Title,
+    Severity,
+    Status,
+    Owner,
+    CreatedTime,
+    LastModifiedTime,
+    AlertIds
+| mv-expand AlertIds
+| join kind=leftouter (
+    SecurityAlert
+    | project
+        AlertId,
+        AlertName=DisplayName,
+        AlertSeverity=Severity,
+        AlertTime=TimeGenerated,
+        ProviderName,
+        Entities
+) on $left.AlertIds == $right.AlertId
+| summarize
+    Alerts=count(),
+    AlertNames=make_set(AlertName,10),
+    Providers=make_set(ProviderName,10),
+    FirstAlert=min(AlertTime),
+    LastAlert=max(AlertTime)
+    by
+    IncidentNumber,
+    Title,
+    Severity,
+    Status,
+    Owner,
+    CreatedTime,
+    LastModifiedTime
+"""
+
+    res = la_query(kql, timespan)
+
+    if not res.get("ok"):
+        return res
+
+    tables = res["data"].get("tables") or []
+    if not tables or not tables[0].get("rows"):
+        return _fail("Incident not found")
+
+    cols = [c["name"] for c in tables[0]["columns"]]
+    row = tables[0]["rows"][0]
+
+    incident = dict(zip(cols, row))
+
+    # Risk heuristic
+    severity = (incident.get("Severity") or "").lower()
+
+    if severity == "high":
+        risk = "High"
+    elif severity == "medium":
+        risk = "Medium"
+    else:
+        risk = "Low"
+
+    return _ok({
+        "mode": "report",
+        "incident_number": incident.get("IncidentNumber"),
+        "title": incident.get("Title"),
+        "severity": incident.get("Severity"),
+        "status": incident.get("Status"),
+        "owner": incident.get("Owner"),
+        "created_time": incident.get("CreatedTime"),
+        "last_modified": incident.get("LastModifiedTime"),
+        "alerts_count": incident.get("Alerts"),
+        "alert_names": incident.get("AlertNames"),
+        "providers": incident.get("Providers"),
+        "first_alert": incident.get("FirstAlert"),
+        "last_alert": incident.get("LastAlert"),
+        "risk_level": risk
+    })
 # ============================
 # Export ASGI App (IMPORTANT)
 # ============================
