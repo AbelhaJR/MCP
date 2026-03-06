@@ -1390,6 +1390,33 @@ SecurityAlert
 
         "risk_level": risk_level
     })
+
+_TOOL_DEFS.append(
+{
+    "name": "list_workspace_tables",
+    "description": "List all tables available in the Log Analytics workspace.",
+    "params": {}
+}
+)
+
+@mcp.tool
+def list_workspace_tables() -> dict:
+
+    kql = """
+    .show tables
+    | project TableName
+    """
+
+    res = la_query(kql, "P1D")
+
+    if not res.get("ok"):
+        return res
+
+    tables = res["data"]["tables"][0]["rows"]
+
+    return _ok({
+        "tables": [t[0] for t in tables]
+    })
 # ============================
 # Export ASGI App (IMPORTANT)
 # ============================
