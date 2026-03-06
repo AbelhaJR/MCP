@@ -1019,7 +1019,7 @@ _TOOL_DEFS.append(
 def get_incident_report(
     incident_id: Optional[str] = None,
     timespan: str = "P7D",
-    top: int = 10
+    top: int = 50
 ) -> dict:
     """
     If incident_id is not provided → list recent incidents.
