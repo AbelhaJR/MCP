@@ -1024,6 +1024,7 @@ def get_incident_report(
 
         kql = f"""
 SecurityIncident
+| where Severity !~ "Informational"
 | sort by CreatedTime desc
 | project
     IncidentNumber,
