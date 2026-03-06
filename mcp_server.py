@@ -17,7 +17,7 @@ mcp = FastMCP("SentinelMCP")
 # Workspace Table Catalog
 # ============================
 
-TABLE_CATALOG_PATH = os.environ.get("TABLE_CATALOG_PATH", "workspace_table_catalog.json")
+TABLE_CATALOG_PATH = os.environ.get("TABLE_CATALOG_PATH", "workspace_tables.json")
 
 WORKSPACE_TABLE_CATALOG = {}
 
