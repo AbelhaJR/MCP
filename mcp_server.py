@@ -1149,18 +1149,20 @@ SecurityIncident
 _TOOL_DEFS.append(
     {
         "name": "investigate_incident",
-        "description": "SOC investigation of a Microsoft Sentinel incident. Extracts alerts, entities, timeline, and risk indicators.",
+        "description": "SOC investigation of a Microsoft Sentinel incident. Extracts alerts, entities, MITRE techniques, and timeline indicators.",
         "params": {
             "incident_id": "Sentinel incident number",
             "timespan": "ISO8601 duration (P1D, P7D)"
         },
     }
 )
+
+
 @mcp.tool
 def investigate_incident(incident_id: str, timespan: str = "P7D") -> dict:
     """
     SOC-style Sentinel incident investigation.
-    Extracts alerts, entities, and timeline indicators.
+    Extracts alerts, entities, timeline, and MITRE indicators.
     """
 
     if not incident_id:
@@ -1174,12 +1176,12 @@ def investigate_incident(incident_id: str, timespan: str = "P7D") -> dict:
     safe_id = escape_kql_string(str(incident_id))
 
     # -----------------------------------
-    # Step 1 — Incident metadata
+    # STEP 1 — INCIDENT METADATA
     # -----------------------------------
 
     incident_kql = f"""
 SecurityIncident
-| where IncidentNumber == {safe_id} or IncidentName =~ "{safe_id}"
+| where IncidentNumber == {safe_id}
 | project
     IncidentNumber,
     Title,
@@ -1207,28 +1209,41 @@ SecurityIncident
 
     alert_ids = incident.get("AlertIds") or []
 
+    # Handle dynamic/string AlertIds
+    if isinstance(alert_ids, str):
+        try:
+            alert_ids = json.loads(alert_ids)
+        except Exception:
+            alert_ids = []
+
     if not alert_ids:
         return _ok({
             "incident": incident,
             "alerts": [],
             "entities": {},
+            "timeline": {},
+            "mitre": {},
+            "risk_level": "Low",
             "assessment": "Incident has no linked alerts"
         })
 
     alert_list = ",".join([f'"{escape_kql_string(a)}"' for a in alert_ids])
 
     # -----------------------------------
-    # Step 2 — Alerts investigation
+    # STEP 2 — ALERT INVESTIGATION
     # -----------------------------------
 
     alerts_kql = f"""
 SecurityAlert
-| where SystemAlertId in ({alert_list}) or AlertId in ({alert_list})
+| where SystemAlertId in ({alert_list})
 | project
-    AlertName = DisplayName,
-    Severity,
-    TimeGenerated,
-    ProviderName,
+    AlertName = ProductName,
+    Component = ProductComponentName,
+    AlertTime = StartTime,
+    Status,
+    CompromisedEntity,
+    Tactics,
+    Techniques,
     Entities
 """
 
@@ -1238,6 +1253,7 @@ SecurityAlert
         return alert_res
 
     tables = alert_res["data"].get("tables") or []
+
     if not tables:
         alerts = []
     else:
@@ -1245,7 +1261,7 @@ SecurityAlert
         alerts = [dict(zip(cols, r)) for r in tables[0]["rows"]]
 
     # -----------------------------------
-    # Step 3 — Extract entities
+    # STEP 3 — ENTITY EXTRACTION
     # -----------------------------------
 
     users = set()
@@ -1253,6 +1269,7 @@ SecurityAlert
     hosts = set()
 
     for alert in alerts:
+
         entities = alert.get("Entities")
 
         if not entities:
@@ -1270,23 +1287,38 @@ SecurityAlert
             if etype == "account":
                 users.add(e.get("Name"))
 
-            if etype == "ip":
+            elif etype == "ip":
                 ips.add(e.get("Address"))
 
-            if etype in ["host", "machine"]:
+            elif etype in ["host", "machine"]:
                 hosts.add(e.get("HostName"))
 
     # -----------------------------------
-    # Step 4 — Timeline
+    # STEP 4 — TIMELINE
     # -----------------------------------
 
-    alert_times = [a.get("TimeGenerated") for a in alerts if a.get("TimeGenerated")]
+    alert_times = [a.get("AlertTime") for a in alerts if a.get("AlertTime")]
 
     first_alert = min(alert_times) if alert_times else None
     last_alert = max(alert_times) if alert_times else None
 
     # -----------------------------------
-    # Step 5 — Risk heuristic
+    # STEP 5 — MITRE EXTRACTION
+    # -----------------------------------
+
+    tactics = set()
+    techniques = set()
+
+    for alert in alerts:
+
+        if alert.get("Tactics"):
+            tactics.add(alert.get("Tactics"))
+
+        if alert.get("Techniques"):
+            techniques.add(alert.get("Techniques"))
+
+    # -----------------------------------
+    # STEP 6 — RISK SCORING
     # -----------------------------------
 
     risk_score = 0
@@ -1294,7 +1326,7 @@ SecurityAlert
     sev = (incident.get("Severity") or "").lower()
 
     if sev == "high":
-        risk_score += 3
+        risk_score += 4
     elif sev == "medium":
         risk_score += 2
     else:
@@ -1309,6 +1341,9 @@ SecurityAlert
     if users:
         risk_score += 1
 
+    if hosts:
+        risk_score += 1
+
     if risk_score >= 6:
         risk_level = "High"
     elif risk_score >= 3:
@@ -1317,10 +1352,11 @@ SecurityAlert
         risk_level = "Low"
 
     # -----------------------------------
-    # Final SOC Report
+    # STEP 7 — FINAL REPORT
     # -----------------------------------
 
     return _ok({
+
         "incident": {
             "id": incident.get("IncidentNumber"),
             "title": incident.get("Title"),
@@ -1329,21 +1365,30 @@ SecurityAlert
             "owner": incident.get("Owner"),
             "created_time": incident.get("CreatedTime"),
         },
+
         "alerts": {
             "count": len(alerts),
-            "names": list({a.get("AlertName") for a in alerts}),
-            "providers": list({a.get("ProviderName") for a in alerts}),
+            "names": list({a.get("AlertName") for a in alerts if a.get("AlertName")}),
+            "components": list({a.get("Component") for a in alerts if a.get("Component")}),
         },
+
         "entities": {
             "users": list(users),
             "ips": list(ips),
             "hosts": list(hosts),
         },
+
         "timeline": {
             "first_alert": first_alert,
             "last_alert": last_alert,
         },
-        "risk_level": risk_level,
+
+        "mitre": {
+            "tactics": list(tactics),
+            "techniques": list(techniques),
+        },
+
+        "risk_level": risk_level
     })
 # ============================
 # Export ASGI App (IMPORTANT)
