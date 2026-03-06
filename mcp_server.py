@@ -1437,7 +1437,8 @@ _TOOL_DEFS.append(
     "name": "get_workspace_table_catalog",
     "description": "Returns the catalog of workspace tables grouped by telemetry type.",
     "params": {}
-}
+})
+
 @mcp.tool
 def get_workspace_table_catalog() -> dict:
     """
