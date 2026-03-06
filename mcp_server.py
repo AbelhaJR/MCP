@@ -1022,8 +1022,8 @@ def get_incident_report(
     top: int = 50
 ) -> dict:
     """
-    If incident_id is not provided → list recent incidents.
-    If incident_id is provided → return detailed incident report.
+    If incident_id is not provided -> list recent incidents.
+    If incident_id is provided -> return detailed incident report.
     """
 
     try:
@@ -1059,15 +1059,11 @@ SecurityIncident
             return res
 
         tables = res["data"].get("tables") or []
-        if not tables:
+        if not tables or not tables[0].get("rows"):
             return _fail("No incidents found")
 
         cols = [c["name"] for c in tables[0]["columns"]]
-
-        incidents = [
-            dict(zip(cols, r))
-            for r in tables[0]["rows"]
-        ]
+        incidents = [dict(zip(cols, r)) for r in tables[0]["rows"]]
 
         return _ok({
             "mode": "list",
@@ -1083,7 +1079,7 @@ SecurityIncident
 
     kql = f"""
 SecurityIncident
-| where IncidentNumber == {safe_id} or IncidentName =~ "{safe_id}"
+| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
 | project
     IncidentNumber,
     Title,
@@ -1094,22 +1090,31 @@ SecurityIncident
     LastModifiedTime,
     AlertIds
 | mv-expand AlertIds
+| extend AlertIdStr = tostring(AlertIds)
 | join kind=leftouter (
     SecurityAlert
     | project
-        AlertId,
-        AlertName=DisplayName,
-        AlertSeverity=Severity,
-        AlertTime=TimeGenerated,
-        ProviderName,
+        SystemAlertId,
+        AlertName = ProductName,
+        AlertComponent = ProductComponentName,
+        AlertStatus = Status,
+        AlertTime = StartTime,
+        CompromisedEntity,
+        Tactics,
+        Techniques,
         Entities
-) on $left.AlertIds == $right.AlertId
+    | extend AlertIdStr = tostring(SystemAlertId)
+) on AlertIdStr
 | summarize
-    Alerts=count(),
-    AlertNames=make_set(AlertName,10),
-    Providers=make_set(ProviderName,10),
-    FirstAlert=min(AlertTime),
-    LastAlert=max(AlertTime)
+    Alerts = countif(isnotempty(AlertIdStr)),
+    AlertNames = make_set(AlertName, 10),
+    AlertComponents = make_set(AlertComponent, 10),
+    AlertStatuses = make_set(AlertStatus, 10),
+    CompromisedEntities = make_set(CompromisedEntity, 10),
+    TacticsSet = make_set(Tactics, 10),
+    TechniquesSet = make_set(Techniques, 10),
+    FirstAlert = min(AlertTime),
+    LastAlert = max(AlertTime)
     by
     IncidentNumber,
     Title,
@@ -1131,10 +1136,8 @@ SecurityIncident
 
     cols = [c["name"] for c in tables[0]["columns"]]
     row = tables[0]["rows"][0]
-
     incident = dict(zip(cols, row))
 
-    # Risk heuristic
     severity = (incident.get("Severity") or "").lower()
 
     if severity == "high":
@@ -1155,7 +1158,11 @@ SecurityIncident
         "last_modified": incident.get("LastModifiedTime"),
         "alerts_count": incident.get("Alerts"),
         "alert_names": incident.get("AlertNames"),
-        "providers": incident.get("Providers"),
+        "alert_components": incident.get("AlertComponents"),
+        "alert_statuses": incident.get("AlertStatuses"),
+        "compromised_entities": incident.get("CompromisedEntities"),
+        "tactics": incident.get("TacticsSet"),
+        "techniques": incident.get("TechniquesSet"),
         "first_alert": incident.get("FirstAlert"),
         "last_alert": incident.get("LastAlert"),
         "risk_level": risk
