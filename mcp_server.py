@@ -1451,6 +1451,18 @@ def get_workspace_table_catalog() -> dict:
     return _ok({
         "catalog": WORKSPACE_TABLE_CATALOG
     })
+_TOOL_DEFS.append(
+{
+    "name": "debug_catalog_loaded",
+    "description": "Returns the catalog of workspace tables grouped by telemetry type and tehir keys.",
+    "params": {}
+})
+@mcp.tool
+def debug_catalog_loaded() -> dict:
+    return {
+        "loaded": bool(WORKSPACE_TABLE_CATALOG),
+        "keys": list(WORKSPACE_TABLE_CATALOG.keys())
+    }
 # ============================
 # Export ASGI App (IMPORTANT)
 # ============================
