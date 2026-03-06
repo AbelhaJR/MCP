@@ -13,6 +13,20 @@ from typing import Any, Dict, List, Optional
 
 mcp = FastMCP("SentinelMCP")
 
+# ============================
+# Workspace Table Catalog
+# ============================
+
+TABLE_CATALOG_PATH = os.environ.get("TABLE_CATALOG_PATH", "workspace_table_catalog.json")
+
+WORKSPACE_TABLE_CATALOG = {}
+
+try:
+    with open(TABLE_CATALOG_PATH, "r") as f:
+        WORKSPACE_TABLE_CATALOG = json.load(f)
+except Exception:
+    WORKSPACE_TABLE_CATALOG = {}
+
 
 
 CONFLUENCE_TEMPLATE = """
@@ -1417,6 +1431,27 @@ def list_workspace_tables() -> dict:
     return _ok({
         "tables": [t[0] for t in tables]
     })
+
+_TOOL_DEFS.append(
+{
+    "name": "get_workspace_table_catalog",
+    "description": "Returns the catalog of workspace tables grouped by telemetry type.",
+    "params": {}
+}
+@mcp.tool
+def get_workspace_table_catalog() -> dict:
+    """
+    Return workspace table catalog used for investigations.
+    """
+
+    if not WORKSPACE_TABLE_CATALOG:
+        return _fail("Workspace table catalog not loaded")
+
+    return _ok({
+        "catalog": WORKSPACE_TABLE_CATALOG
+    })
+    
+)
 # ============================
 # Export ASGI App (IMPORTANT)
 # ============================
