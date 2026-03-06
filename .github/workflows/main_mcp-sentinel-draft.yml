@@ -44,6 +44,7 @@ jobs:
             function_app.py \
             mcp_server.py \
             host.json \
+            workspace_tables.json \
             requirements.txt \
             .python_packages
 
@@ -74,3 +75,4 @@ jobs:
           package: release.zip
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_A7910988EBF64CA4AD382819EAA0E96A }}
           sku: 'flexconsumption'
+
