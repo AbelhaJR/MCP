@@ -16,15 +16,17 @@ mcp = FastMCP("SentinelMCP")
 # ============================
 # Workspace Table Catalog
 # ============================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-TABLE_CATALOG_PATH = os.environ.get("TABLE_CATALOG_PATH", "workspace_tables.json")
+TABLE_CATALOG_PATH = os.path.join(BASE_DIR, "workspace_tables.json")
 
 WORKSPACE_TABLE_CATALOG = {}
 
 try:
     with open(TABLE_CATALOG_PATH, "r") as f:
         WORKSPACE_TABLE_CATALOG = json.load(f)
-except Exception:
+except Exception as e:
+    print("Failed to load workspace catalog:", e)
     WORKSPACE_TABLE_CATALOG = {}
 
 
