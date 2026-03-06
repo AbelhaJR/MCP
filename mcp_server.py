@@ -1451,8 +1451,6 @@ def get_workspace_table_catalog() -> dict:
     return _ok({
         "catalog": WORKSPACE_TABLE_CATALOG
     })
-    
-)
 # ============================
 # Export ASGI App (IMPORTANT)
 # ============================
