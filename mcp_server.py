@@ -78,10 +78,10 @@ MAX_ROWS_HARD = 200
 DEFAULT_ROWS = 50
 
 # Keep run_query bounded (Teams-friendly + safety)
-MAX_HOURS_RUN_QUERY = 24
+MAX_HOURS_RUN_QUERY = 72
 
 # For listing tables, P1D is the most intuitive default
-DEFAULT_TIMESPAN = os.environ.get("DEFAULT_TIMESPAN", "P1D")
+DEFAULT_TIMESPAN = os.environ.get("DEFAULT_TIMESPAN", "P3D")
 
 # Lower timeout to avoid Teams/M365 action timeouts masking the real error
 HTTP_TIMEOUT_SECONDS = int(os.environ.get("LA_HTTP_TIMEOUT", "15"))
