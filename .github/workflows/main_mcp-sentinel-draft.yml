@@ -36,24 +36,24 @@ jobs:
 
       - name: Verify project layout
         run: |
+          test -d mcp_server
+          test -f mcp_server/__init__.py
+          test -f mcp_server/app.py
           test -f function_app.py
           test -f mcp_server.py
           test -f host.json
           test -f requirements.txt
           test -f workspace_tables.json
-          test -d mcp_server
-          test -f mcp_server/__init__.py
-          test -f mcp_server/app.py
 
       - name: Create deployment package
         run: |
           zip -r release.zip \
+            mcp_server \
             function_app.py \
             mcp_server.py \
             host.json \
             requirements.txt \
             workspace_tables.json \
-            mcp_server \
             .python_packages
 
       - name: Upload artifact
