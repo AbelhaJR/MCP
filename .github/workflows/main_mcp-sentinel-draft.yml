@@ -7,24 +7,21 @@ on:
   workflow_dispatch:
 
 env:
-  PYTHON_VERSION: '3.13'   # MUST match Azure runtime version
+  PYTHON_VERSION: '3.13'
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout repo
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Setup Python
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # Install Azure-compatible Linux wheels
       - name: Install dependencies for Azure Linux runtime
         run: |
           python -m pip install --upgrade pip
@@ -37,7 +34,17 @@ jobs:
             --target=.python_packages/lib/site-packages \
             -r requirements.txt
 
-      # Create clean deployment zip
+      - name: Verify project layout
+        run: |
+          test -f function_app.py
+          test -f mcp_server.py
+          test -f host.json
+          test -f requirements.txt
+          test -f workspace_tables.json
+          test -d mcp_server
+          test -f mcp_server/__init__.py
+          test -f mcp_server/app.py
+
       - name: Create deployment package
         run: |
           zip -r release.zip \
@@ -46,9 +53,9 @@ jobs:
             host.json \
             requirements.txt \
             workspace_tables.json \
+            mcp_server \
             .python_packages
 
-      # Upload artifact
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -60,13 +67,11 @@ jobs:
     needs: build
 
     steps:
-      # Download artifact
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: functionapp-package
 
-      # Deploy to Azure
       - name: Deploy to Azure Functions
         uses: Azure/functions-action@v1
         with:
@@ -75,5 +80,3 @@ jobs:
           package: release.zip
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_A7910988EBF64CA4AD382819EAA0E96A }}
           sku: 'flexconsumption'
-
-
