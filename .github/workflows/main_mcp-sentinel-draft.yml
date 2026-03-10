@@ -42,8 +42,8 @@ jobs:
       - name: Verify required files exist
         run: |
           test -f function_app.py
-          test -f mcp_server.py
           test -f host.json
+          test -f mcp_server.py
           test -f requirements.txt
           test -f workspace_tables.json
 
@@ -51,8 +51,8 @@ jobs:
         run: |
           zip -r release.zip \
             function_app.py \
-            mcp_server.py \
             host.json \
+            mcp_server.py \
             requirements.txt \
             workspace_tables.json \
             .python_packages
@@ -92,3 +92,4 @@ jobs:
           package: './release.zip'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_A7910988EBF64CA4AD382819EAA0E96A }}
           sku: 'flexconsumption'
+
