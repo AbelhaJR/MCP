@@ -39,6 +39,13 @@ jobs:
           test -d mcp_server
           test -f mcp_server/__init__.py
           test -f mcp_server/app.py
+          test -d mcp_server/services
+          test -f mcp_server/services/__init__.py
+          test -f mcp_server/services/analytics_rules.py
+          test -d mcp_server/tools
+          test -f mcp_server/tools/__init__.py
+          test -d mcp_server/clients
+          test -f mcp_server/clients/__init__.py
           test -f function_app.py
           test -f mcp_server.py
           test -f host.json
@@ -48,13 +55,17 @@ jobs:
       - name: Create deployment package
         run: |
           zip -r release.zip \
-            mcp_server \
             function_app.py \
             mcp_server.py \
             host.json \
             requirements.txt \
             workspace_tables.json \
+            mcp_server \
             .python_packages
+
+      - name: Show zip contents
+        run: |
+          unzip -l release.zip | sed -n '1,200p'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -71,12 +82,19 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: functionapp-package
+          path: .
+
+      - name: Verify downloaded artifact
+        run: |
+          ls -la
+          test -f release.zip
+          unzip -l release.zip | sed -n '1,200p'
 
       - name: Deploy to Azure Functions
         uses: Azure/functions-action@v1
         with:
           app-name: 'mcp-sentinel-draft'
           slot-name: 'Production'
-          package: release.zip
+          package: './release.zip'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_A7910988EBF64CA4AD382819EAA0E96A }}
           sku: 'flexconsumption'
