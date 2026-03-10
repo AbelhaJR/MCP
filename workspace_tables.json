@@ -148,7 +148,7 @@
   ],
 
   "cmdb_and_asset_context": [
-    "CMDB_CL"
+    "COVERAGE_CMDB"
   ],
 
   "backup_and_recovery": [
