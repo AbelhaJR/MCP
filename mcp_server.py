@@ -1,410 +1,1120 @@
-from __future__ import annotations
-
-import json
+from fastmcp import FastMCP
+import requests
 import os
 import re
+import json
+import urllib.request
 import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
-
-import requests
-from fastmcp import FastMCP
-
+from typing import Any, Dict, List, Optional, Tuple
 
 # ============================================================
-# CONFIG
+# MCP SETUP
 # ============================================================
 
-@dataclass(frozen=True)
-class Settings:
-    workspace_id: str
-    workspace_name: str
-    subscription_id: str
-    resource_group: str
-    default_timespan: str
-    la_http_timeout: int
-    max_rows_hard: int
-    max_hours_run_query: int
-    max_hours_investigation: int
-    enable_run_kql: bool
-    catalog_path: str
-
-
-def _as_bool(value: str | None, default: bool) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def get_settings() -> Settings:
-    return Settings(
-        workspace_id=os.environ.get("WORKSPACE_ID", ""),
-        workspace_name=os.environ.get("WORKSPACE_NAME", ""),
-        subscription_id=os.environ.get("SUBSCRIPTION_ID", ""),
-        resource_group=os.environ.get("RESOURCE_GROUP", ""),
-        default_timespan=os.environ.get("DEFAULT_TIMESPAN", "P3D"),
-        la_http_timeout=int(os.environ.get("LA_HTTP_TIMEOUT", "20")),
-        max_rows_hard=int(os.environ.get("MAX_ROWS_HARD", "200")),
-        max_hours_run_query=int(os.environ.get("MAX_HOURS_RUN_QUERY", "72")),
-        max_hours_investigation=int(os.environ.get("MAX_HOURS_INVESTIGATION", "168")),
-        enable_run_kql=_as_bool(os.environ.get("ENABLE_RUN_KQL"), True),
-        catalog_path=os.environ.get("WORKSPACE_TABLE_CATALOG_PATH", "workspace_tables.json"),
-    )
-
-
-def validate_required_settings(settings: Settings) -> list[str]:
-    missing: list[str] = []
-    if not settings.workspace_id:
-        missing.append("WORKSPACE_ID")
-    if not settings.workspace_name:
-        missing.append("WORKSPACE_NAME")
-    if not settings.subscription_id:
-        missing.append("SUBSCRIPTION_ID")
-    if not settings.resource_group:
-        missing.append("RESOURCE_GROUP")
-    return missing
-
+mcp = FastMCP("SentinelMCP")
 
 # ============================================================
-# RESPONSE HELPERS
+# PATHS / CATALOG
 # ============================================================
 
-def ok(data: Any, **meta: Any) -> dict:
-    return {
-        "ok": True,
-        "data": data,
-        "meta": meta or {},
-    }
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TABLE_CATALOG_PATH = os.path.join(BASE_DIR, "workspace_tables.json")
 
+WORKSPACE_TABLE_CATALOG: Dict[str, List[str]] = {}
 
-def fail(code: str, message: str, detail: str | None = None, **meta: Any) -> dict:
-    return {
-        "ok": False,
-        "error": {
-            "code": code,
-            "message": message,
-            "detail": detail,
-        },
-        "meta": meta or {},
-    }
-
+try:
+    with open(TABLE_CATALOG_PATH, "r", encoding="utf-8") as f:
+        raw_catalog = json.load(f)
+        if isinstance(raw_catalog, dict):
+            WORKSPACE_TABLE_CATALOG = {
+                str(k): [str(v) for v in vals if isinstance(v, str)]
+                for k, vals in raw_catalog.items()
+                if isinstance(vals, list)
+            }
+        else:
+            print("Workspace catalog is not a JSON object")
+except Exception as e:
+    print("Failed to load workspace catalog:", e)
+    WORKSPACE_TABLE_CATALOG = {}
 
 # ============================================================
-# UTILS
+# CONFIGURATION
 # ============================================================
 
-_TIMESPAN_RE = re.compile(r"^P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?)?$", re.IGNORECASE)
-_TABLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
-_TOKEN_CACHE: dict[str, dict[str, Any]] = {}
+SUBSCRIPTION_ID = os.environ.get("SUBSCRIPTION_ID")
+RESOURCE_GROUP = os.environ.get("RESOURCE_GROUP")
+WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME")
+WORKSPACE_ID = os.environ.get("WORKSPACE_ID")
 
 LOG_ANALYTICS_RESOURCE = "https://api.loganalytics.io/"
 ARM_RESOURCE = "https://management.azure.com/"
 IMDS_ENDPOINT = "http://169.254.169.254/metadata/identity/oauth2/token"
 
+MAX_ROWS_HARD = 200
+DEFAULT_ROWS = 50
 
-def parse_timespan_to_hours(value: str) -> int:
-    match = _TIMESPAN_RE.fullmatch(value.strip())
-    if not match:
-        raise ValueError("Timespan must be ISO8601 like PT6H, P1D, or P7D")
-    days = int(match.group("days") or 0)
-    hours = int(match.group("hours") or 0)
-    total = days * 24 + hours
-    if total <= 0:
-        raise ValueError("Timespan must be greater than zero")
-    return total
+DEFAULT_TIMESPAN = os.environ.get("DEFAULT_TIMESPAN", "P3D")
+HTTP_TIMEOUT_SECONDS = int(os.environ.get("LA_HTTP_TIMEOUT", "15"))
 
-
-def clamp_rows(value: int, hard_limit: int) -> int:
-    if value <= 0:
-        return min(50, hard_limit)
-    return min(value, hard_limit)
-
-
-def validate_table_name(table: str) -> str:
-    if not table or not _TABLE_RE.fullmatch(table):
-        raise ValueError("Invalid table name")
-    return table
-
-
-def escape_kql_string(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def ensure_take_limit(kql: str, limit: int) -> str:
-    if re.search(r"\|\s*take\s+\d+", kql, flags=re.IGNORECASE):
-        return kql
-    return f"{kql.rstrip()}\n| take {limit}"
-
-
-def kql_safety_check(kql: str) -> None:
-    blocked = [
-        r"\.show\s+tables",
-        r"\.drop\b",
-        r"\.delete\b",
-        r"\.alter\b",
-        r"\.create\b",
-        r"\.ingest\b",
-    ]
-    lowered = kql.lower()
-    for pattern in blocked:
-        if re.search(pattern, lowered):
-            raise ValueError(f"KQL contains blocked pattern: {pattern}")
-
-
-def detect_entity_type(value: str) -> str:
-    value = value.strip()
-    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", value):
-        return "ip"
-    if "@" in value:
-        return "user"
-    if re.fullmatch(r"[a-fA-F0-9]{64}", value):
-        return "sha256"
-    if re.fullmatch(r"[a-fA-F0-9]{40}", value):
-        return "sha1"
-    if re.fullmatch(r"[a-fA-F0-9]{32}", value):
-        return "md5"
-    if "." in value:
-        return "domain"
-    return "host"
-
-
-def parse_la_rows(result: dict) -> list[dict[str, Any]]:
-    if not result.get("ok"):
-        return []
-    tables = (result.get("data") or {}).get("tables") or []
-    if not tables:
-        return []
-    columns = [c["name"] for c in tables[0].get("columns", [])]
-    return [dict(zip(columns, row)) for row in tables[0].get("rows", [])]
-
+MAX_HOURS_RUN_QUERY = 72
+MAX_HOURS_ANALYZE_ENTITY = 168
+MAX_HOURS_INCIDENT = 168
 
 # ============================================================
-# CATALOG
+# RESPONSE HELPERS
 # ============================================================
 
-class WorkspaceCatalog:
-    def __init__(self, catalog_path: str):
-        self.catalog_path = Path(catalog_path)
-        self._data = self._load()
+def _ok(data: Any, **meta) -> dict:
+    out = {"ok": True, "data": data}
+    if meta:
+        out["meta"] = meta
+    return out
 
-    def _load(self) -> dict[str, list[str]]:
-        if not self.catalog_path.exists():
-            return {}
-        raw = json.loads(self.catalog_path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise ValueError("Workspace catalog must be a JSON object")
-        normalized: dict[str, list[str]] = {}
-        for key, value in raw.items():
-            if isinstance(value, list):
-                normalized[str(key)] = [str(v) for v in value if isinstance(v, str)]
-        return normalized
+def _fail(
+    message: str,
+    *,
+    code: Optional[str] = None,
+    status_code: Optional[int] = None,
+    detail: Optional[str] = None,
+    **meta,
+) -> dict:
+    out = {"ok": False, "error": {"message": message}}
+    if code:
+        out["error"]["code"] = code
+    if status_code is not None:
+        out["error"]["status_code"] = status_code
+    if detail:
+        out["error"]["detail"] = detail
+    if meta:
+        out["meta"] = meta
+    return out
 
-    @property
-    def data(self) -> dict[str, list[str]]:
-        return self._data
+# ============================================================
+# TOOL INVENTORY
+# ============================================================
 
-    def get(self, key: str) -> list[str]:
-        return list(self._data.get(key, []))
+_TOOL_DEFS: List[dict] = []
 
-    def keys(self) -> list[str]:
-        return sorted(self._data.keys())
-
-    def search_categories(self, text: str) -> dict[str, list[str]]:
-        text = text.lower().strip()
-        out: dict[str, list[str]] = {}
-        for key, tables in self._data.items():
-            if text in key.lower() or any(text in t.lower() for t in tables):
-                out[key] = tables
-        return out
-
-    def cmdb_tables(self) -> list[str]:
-        for key in self._data:
-            if "cmdb" in key.lower():
-                return self._data[key]
-        return []
-
-    def telemetry_domains_for_entity(self, entity_type: str) -> list[str]:
-        mapping = {
-            "ip": [
-                "alerts_and_incidents",
-                "identity_and_authentication",
-                "endpoint_microsoft_defender",
-                "network_security_devices",
-                "network_and_proxy",
-                "cmdb_and_asset_context",
-            ],
-            "user": [
-                "alerts_and_incidents",
-                "identity_and_authentication",
-                "endpoint_microsoft_defender",
-                "email_and_m365",
-                "identity_governance_and_pam",
-            ],
-            "host": [
-                "alerts_and_incidents",
-                "endpoint_microsoft_defender",
-                "windows_servers",
-                "linux_servers",
-                "cmdb_and_asset_context",
-            ],
-            "domain": [
-                "alerts_and_incidents",
-                "network_and_proxy",
-                "dns_and_ip_management",
-                "email_and_m365",
-            ],
-            "sha256": [
-                "alerts_and_incidents",
-                "endpoint_microsoft_defender",
-                "security_and_behavior_analytics",
-            ],
-            "sha1": [
-                "alerts_and_incidents",
-                "endpoint_microsoft_defender",
-                "security_and_behavior_analytics",
-            ],
-            "md5": [
-                "alerts_and_incidents",
-                "endpoint_microsoft_defender",
-                "security_and_behavior_analytics",
-            ],
+def _register_tool_def(name: str, description: str, params: dict) -> None:
+    _TOOL_DEFS.append(
+        {
+            "name": name,
+            "description": description,
+            "params": params,
         }
-        default_domains = ["alerts_and_incidents", "identity_and_authentication"]
-        return [d for d in mapping.get(entity_type, default_domains) if d in self._data]
-
-    def tables_for_domains(self, domains: list[str]) -> list[str]:
-        out: list[str] = []
-        seen: set[str] = set()
-        for domain in domains:
-            for table in self._data.get(domain, []):
-                if table not in seen:
-                    seen.add(table)
-                    out.append(table)
-        return out
-
+    )
 
 # ============================================================
-# AUTH / HTTP CLIENTS
+# MANAGED IDENTITY
 # ============================================================
+
+_TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def get_managed_identity_token(resource: str) -> str:
     now = int(time.time())
+
     cached = _TOKEN_CACHE.get(resource)
-    if cached and cached["exp"] - now > 60:
+    if cached and cached.get("exp", 0) - now > 60:
         return cached["token"]
 
-    response = requests.get(
-        IMDS_ENDPOINT,
-        params={"api-version": "2018-02-01", "resource": resource},
-        headers={"Metadata": "true"},
-        timeout=5,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    token = payload["access_token"]
-    expires_on = int(payload.get("expires_on", now + 300))
-    _TOKEN_CACHE[resource] = {"token": token, "exp": expires_on}
-    return token
+    identity_endpoint = os.environ.get("IDENTITY_ENDPOINT") or os.environ.get("MSI_ENDPOINT")
+    identity_header = os.environ.get("IDENTITY_HEADER") or os.environ.get("MSI_SECRET")
+    client_id = os.environ.get("MANAGED_IDENTITY_CLIENT_ID")
 
+    # App Service / Function App managed identity endpoint
+    if identity_endpoint and identity_header:
+        sep = "&" if "?" in identity_endpoint else "?"
+        extra = f"&client_id={client_id}" if client_id else ""
+        url = f"{identity_endpoint}{sep}resource={resource}&api-version=2019-08-01{extra}"
 
-def la_query(settings: Settings, kql: str, timespan: str) -> dict:
-    if not settings.workspace_id:
-        return fail("CONFIG_ERROR", "WORKSPACE_ID is not configured")
+        req = urllib.request.Request(
+            url,
+            headers={
+                "X-IDENTITY-HEADER": identity_header,
+                "Metadata": "true",
+            },
+            method="GET",
+        )
 
-    url = f"https://api.loganalytics.io/v1/workspaces/{settings.workspace_id}/query"
-    token = get_managed_identity_token(LOG_ANALYTICS_RESOURCE)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+            token = payload["access_token"]
+            expires_in = int(payload.get("expires_in") or 300)
 
-    response = requests.post(
+            _TOKEN_CACHE[resource] = {
+                "token": token,
+                "exp": now + expires_in,
+            }
+            return token
+
+    # Fallback IMDS
+    extra = f"&client_id={client_id}" if client_id else ""
+    url = f"{IMDS_ENDPOINT}?api-version=2018-02-01&resource={resource}{extra}"
+    req = urllib.request.Request(
         url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={"query": kql, "timespan": timespan},
-        timeout=settings.la_http_timeout,
+        headers={"Metadata": "true"},
+        method="GET",
     )
 
-    if response.status_code >= 400:
-        return fail(
-            "LOG_ANALYTICS_ERROR",
-            f"Log Analytics query failed with HTTP {response.status_code}",
-            detail=response.text[:1500],
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        payload = json.loads(resp.read().decode())
+        token = payload["access_token"]
+        expires_in = int(payload.get("expires_in") or 300)
+
+        _TOKEN_CACHE[resource] = {
+            "token": token,
+            "exp": now + expires_in,
+        }
+        return token
+
+# ============================================================
+# GUARDRAILS / HELPERS
+# ============================================================
+
+_TABLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+def parse_timespan_to_hours(timespan: str) -> float:
+    """
+    Supports:
+      - PT#H
+      - PT#M
+      - PT#H#M
+      - P#D
+    """
+    ts = (timespan or "").strip()
+
+    m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?", ts)
+    if m:
+        h = int(m.group(1) or 0)
+        mins = int(m.group(2) or 0)
+        total = h + mins / 60.0
+        if total <= 0:
+            raise ValueError("Timespan must be > 0")
+        return total
+
+    d = re.fullmatch(r"P(\d+)D", ts)
+    if d:
+        days = int(d.group(1))
+        if days <= 0:
+            raise ValueError("Timespan must be > 0")
+        return days * 24.0
+
+    raise ValueError("Invalid timespan format. Use PT1H, PT6H, PT24H or P1D, P7D.")
+
+def clamp_rows(n: Any) -> int:
+    try:
+        v = int(n)
+    except Exception:
+        v = DEFAULT_ROWS
+    return max(1, min(v, MAX_ROWS_HARD))
+
+def escape_kql_string(s: str) -> str:
+    return (s or "").replace('"', '""')
+
+def validate_table_name(table: str) -> str:
+    if not table or not isinstance(table, str):
+        raise ValueError("Table name is required")
+    table = table.strip()
+    if not _TABLE_RE.fullmatch(table):
+        raise ValueError("Invalid table name")
+    return table
+
+def kql_safety_check(kql: str):
+    lowered = (kql or "").lower()
+
+    if re.fullmatch(r"\s*search\s+\*\s*", lowered):
+        raise ValueError("KQL too broad: 'search *' not allowed")
+
+    blocked = [
+        "externaldata",
+        "evaluate",
+        "make-series",
+        ".drop",
+        ".delete",
+        ".alter",
+        ".create",
+        ".ingest",
+    ]
+
+    for op in blocked:
+        if op in lowered:
+            raise ValueError(f"KQL contains blocked operator: {op}")
+
+def ensure_take_limit(kql: str, limit: int) -> str:
+    lowered = (kql or "").lower()
+    if "| take" in lowered or "| limit" in lowered:
+        return kql
+    return f"{kql}\n| take {limit}"
+
+def detect_entity_type(value: str) -> str:
+    v = (value or "").strip()
+
+    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", v):
+        try:
+            parts = [int(x) for x in v.split(".")]
+            if all(0 <= p <= 255 for p in parts):
+                return "ip"
+        except Exception:
+            pass
+
+    if "@" in v:
+        return "user"
+
+    if re.fullmatch(r"[a-fA-F0-9]{64}", v):
+        return "sha256"
+
+    if re.fullmatch(r"[a-fA-F0-9]{40}", v):
+        return "sha1"
+
+    if re.fullmatch(r"[a-fA-F0-9]{32}", v):
+        return "md5"
+
+    if "." in v:
+        return "domain"
+
+    return "host"
+
+def _la_first_table_rows(payload: dict) -> Tuple[List[str], List[List[Any]]]:
+    tables = payload.get("tables") or []
+    if not tables:
+        return [], []
+    t0 = tables[0]
+    columns = [c.get("name") for c in (t0.get("columns") or [])]
+    rows = t0.get("rows") or []
+    return columns, rows
+
+def _la_first_table_dicts(payload: dict) -> List[dict]:
+    columns, rows = _la_first_table_rows(payload)
+    return [dict(zip(columns, r)) for r in rows]
+
+def _flatten_catalog_tables() -> List[str]:
+    seen = set()
+    out = []
+    for tables in WORKSPACE_TABLE_CATALOG.values():
+        for t in tables:
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+    return out
+
+def _catalog_domains_for_entity(entity_type: str) -> List[str]:
+    mapping = {
+        "ip": [
+            "alerts_and_incidents",
+            "identity_and_authentication",
+            "endpoint_microsoft_defender",
+            "network_security_devices",
+            "network_and_proxy",
+            "cmdb_and_asset_context",
+        ],
+        "user": [
+            "alerts_and_incidents",
+            "identity_and_authentication",
+            "endpoint_microsoft_defender",
+            "email_and_m365",
+            "identity_governance_and_pam",
+        ],
+        "host": [
+            "alerts_and_incidents",
+            "endpoint_microsoft_defender",
+            "windows_servers",
+            "linux_servers",
+            "cmdb_and_asset_context",
+        ],
+        "domain": [
+            "alerts_and_incidents",
+            "network_and_proxy",
+            "dns_and_ip_management",
+            "email_and_m365",
+        ],
+        "sha256": [
+            "alerts_and_incidents",
+            "endpoint_microsoft_defender",
+            "security_and_behavior_analytics",
+        ],
+        "sha1": [
+            "alerts_and_incidents",
+            "endpoint_microsoft_defender",
+            "security_and_behavior_analytics",
+        ],
+        "md5": [
+            "alerts_and_incidents",
+            "endpoint_microsoft_defender",
+            "security_and_behavior_analytics",
+        ],
+    }
+    preferred = mapping.get(entity_type, ["alerts_and_incidents", "identity_and_authentication"])
+    return [d for d in preferred if d in WORKSPACE_TABLE_CATALOG]
+
+def _catalog_tables_for_domains(domains: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for domain in domains:
+        for table in WORKSPACE_TABLE_CATALOG.get(domain, []):
+            if table not in seen:
+                seen.add(table)
+                out.append(table)
+    return out
+
+def _find_cmdb_table() -> Optional[str]:
+    for key, tables in WORKSPACE_TABLE_CATALOG.items():
+        if "cmdb" in key.lower() and tables:
+            return tables[0]
+    return None
+
+# ============================================================
+# LOG ANALYTICS / ARM CLIENTS
+# ============================================================
+
+def la_query(kql: str, timespan: str) -> dict:
+    if not WORKSPACE_ID:
+        return _fail("WORKSPACE_ID not configured on the Function App", code="CONFIG_ERROR")
+
+    try:
+        token = get_managed_identity_token(LOG_ANALYTICS_RESOURCE)
+    except Exception as e:
+        return _fail(
+            "Failed to acquire Managed Identity token",
+            code="MANAGED_IDENTITY_ERROR",
+            detail=str(e),
+        )
+
+    url = f"https://api.loganalytics.io/v1/workspaces/{WORKSPACE_ID}/query"
+
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "query": kql,
+                "timespan": timespan,
+            },
+            timeout=HTTP_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        return _fail(
+            "HTTP request to Log Analytics failed",
+            code="HTTP_ERROR",
+            detail=str(e),
+            timespan=timespan,
+        )
+
+    if not response.ok:
+        return _fail(
+            "Log Analytics query failed",
+            code="LOG_ANALYTICS_ERROR",
+            status_code=response.status_code,
+            detail=response.text,
             timespan=timespan,
         )
 
     try:
-        return ok(response.json(), timespan=timespan)
-    except Exception as exc:
-        return fail("PARSE_ERROR", "Failed to parse Log Analytics response", detail=str(exc))
+        return _ok(response.json(), timespan=timespan)
+    except Exception as e:
+        return _fail(
+            "Failed to parse Log Analytics JSON response",
+            code="PARSE_ERROR",
+            detail=str(e),
+            timespan=timespan,
+        )
 
+def _arm_get(url: str) -> dict:
+    try:
+        token = get_managed_identity_token(ARM_RESOURCE)
+    except Exception as e:
+        return _fail("Failed to acquire ARM token", code="MANAGED_IDENTITY_ERROR", detail=str(e))
 
-def arm_get(settings: Settings, path: str, api_version: str) -> dict:
-    token = get_managed_identity_token(ARM_RESOURCE)
-    url = f"https://management.azure.com{path}"
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=HTTP_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        return _fail("HTTP request to ARM failed", code="HTTP_ERROR", detail=str(e))
 
-    response = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        params={"api-version": api_version},
-        timeout=settings.la_http_timeout,
-    )
-
-    if response.status_code >= 400:
-        return fail(
-            "ARM_ERROR",
-            f"ARM GET failed with HTTP {response.status_code}",
-            detail=response.text[:1500],
+    if not resp.ok:
+        return _fail(
+            "ARM request failed",
+            code="ARM_ERROR",
+            status_code=resp.status_code,
+            detail=resp.text,
         )
 
     try:
-        return ok(response.json())
-    except Exception as exc:
-        return fail("PARSE_ERROR", "Failed to parse ARM response", detail=str(exc))
-
+        return _ok(resp.json())
+    except Exception as e:
+        return _fail("Failed to parse ARM JSON response", code="PARSE_ERROR", detail=str(e))
 
 # ============================================================
-# SERVICE: SCHEMA / TABLES
+# ANALYTICS RULE HELPERS
 # ============================================================
 
-def service_get_workspace_catalog(catalog: WorkspaceCatalog) -> dict:
-    return ok({"catalog": catalog.data})
+CONFLUENCE_TEMPLATE = """
+<p><strong>TYPE:</strong> USE CASE - <strong>SEVERITY:</strong> {severity}</p>
+<hr/>
 
+<h1>USE CASE SUMMARY</h1>
+<p><strong>Purpose</strong></p>
+<p>The purpose of this document is to describe the detection logic and implementation of the use case <strong>{rule_name}</strong>.</p>
 
-def service_preview_table(settings: Settings, table: str, timespan: str) -> dict:
+<hr/>
+
+<h1>Threat Layer</h1>
+
+<h2>MITRE ATT&CK</h2>
+<table>
+<tr><th>Tactic</th><th>Technique</th></tr>
+{mitre_rows}
+</table>
+
+<h2>Cyber Kill Chain</h2>
+<p>The use case primarily addresses the following phase:</p>
+<p><strong>{kill_chain_phase}</strong></p>
+
+<h2>References</h2>
+<ul>
+<li>Microsoft Sentinel analytic rule: {rule_name}</li>
+</ul>
+
+<hr/>
+
+<h1>Implementation Layer</h1>
+
+<h2>Log Sources</h2>
+<p>{tables}</p>
+
+<h2>Scope</h2>
+<p>This rule runs every {query_frequency} with a lookback of {query_period}.</p>
+
+<h2>Monitoring Rules</h2>
+<pre>{kql}</pre>
+
+<h2>Entities</h2>
+<ul>
+{entities}
+</ul>
+"""
+
+def _extract_tables_from_kql(kql: str) -> List[str]:
+    if not kql:
+        return []
+    candidates = re.findall(r"(?m)^\s*([A-Za-z][A-Za-z0-9_]*)\s*\|", kql)
+    seen = set()
+    out = []
+    for t in candidates:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+def _extract_ops_from_kql(kql: str) -> List[str]:
+    if not kql:
+        return []
+    ops = [
+        "where", "summarize", "join", "extend",
+        "project", "project-away", "parse",
+        "mv-expand", "evaluate", "union",
+        "lookup", "distinct"
+    ]
+    lowered = kql.lower()
+    return [op for op in ops if re.search(rf"\b{re.escape(op)}\b", lowered)]
+
+def _extract_threshold_snippets(kql: str) -> List[str]:
+    if not kql:
+        return []
+    matches = re.findall(
+        r"(?i)\bwhere\b[^\n]{0,140}?(?:>=|<=|==|!=|>|<)\s*\d+(?:\.\d+)?",
+        kql,
+    )
+    seen = set()
+    out = []
+    for m in matches:
+        m2 = " ".join(m.split())
+        if m2 not in seen:
+            seen.add(m2)
+            out.append(m2)
+        if len(out) >= 10:
+            break
+    return out
+
+def _detect_entity_hints(kql: str) -> List[str]:
+    if not kql:
+        return []
+    fields = [
+        "UserPrincipalName", "Account", "AccountName", "AadUserId",
+        "IPAddress", "IpAddress", "CallerIpAddress", "RemoteIP",
+        "DeviceName", "Computer", "HostName",
+        "FileName", "SHA256", "SHA1", "MD5",
+        "ProcessCommandLine", "CommandLine", "Url", "RemoteUrl"
+    ]
+    hits = []
+    for f in fields:
+        if re.search(rf"\b{re.escape(f)}\b", kql, re.IGNORECASE):
+            hits.append(f)
+    return hits[:20]
+
+def _kql_one_liner_summary(kql: str) -> str:
+    if not kql:
+        return ""
+    lines = [ln.strip() for ln in kql.splitlines() if ln.strip()]
+    head = lines[0] if lines else ""
+    ops = _extract_ops_from_kql(kql)
+    if ops:
+        return f"{head} (ops: {', '.join(ops[:8])})"
+    return head
+
+def _sentinel_rules_base_url() -> str:
+    if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
+        raise ValueError("SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured")
+
+    return (
+        f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}"
+        f"/resourceGroups/{RESOURCE_GROUP}"
+        f"/providers/Microsoft.OperationalInsights/workspaces/{WORKSPACE_NAME}"
+        f"/providers/Microsoft.SecurityInsights/alertRules"
+    )
+
+def _fetch_rule_by_id(rule_id: str) -> dict:
+    base = _sentinel_rules_base_url()
+    url = f"{base}/{rule_id}?api-version=2023-09-01-preview"
+    return _arm_get(url)
+
+def _find_rule_id_by_name(rule_name: str) -> Optional[str]:
+    base = _sentinel_rules_base_url()
+    url = f"{base}?api-version=2023-09-01-preview"
+
+    res = _arm_get(url)
+    if not res.get("ok"):
+        return None
+
+    target = (rule_name or "").strip().lower()
+
+    for it in (res["data"].get("value") or []):
+        props = it.get("properties") or {}
+        dn = (props.get("displayName") or "").strip().lower()
+        if dn == target:
+            return it.get("name")
+
+    return None
+
+def _build_confluence_html(doc: dict) -> str:
+    mitre_rows = ""
+    tactics = doc.get("mitre_tactics", [])
+
+    if tactics:
+        for t in tactics:
+            mitre_rows += f"<tr><td>{t}</td><td></td></tr>"
+    else:
+        mitre_rows = "<tr><td>N/A</td><td>N/A</td></tr>"
+
+    entities_html = ""
+    for e in doc.get("kql", {}).get("entity_field_hints", []):
+        entities_html += f"<li>{e}</li>"
+    if not entities_html:
+        entities_html = "<li>N/A</li>"
+
+    tables = ", ".join(doc.get("kql", {}).get("tables_used", [])) or "Not detected"
+
+    return CONFLUENCE_TEMPLATE.format(
+        severity=doc.get("severity", "N/A"),
+        rule_name=doc.get("rule_display_name", "N/A"),
+        mitre_rows=mitre_rows,
+        kill_chain_phase="Detection / Command & Control",
+        tables=tables,
+        query_frequency=doc.get("schedule", {}).get("query_frequency", "N/A"),
+        query_period=doc.get("schedule", {}).get("query_period", "N/A"),
+        kql=doc.get("kql", {}).get("query", ""),
+        entities=entities_html,
+    )
+
+# ============================================================
+# TOOLS
+# ============================================================
+
+_register_tool_def(
+    "get_tools",
+    "Returns the exact MCP tool list and parameter formats.",
+    {}
+)
+
+@mcp.tool
+def get_tools() -> dict:
+    return _ok({"tools": _TOOL_DEFS, "mcp_path": "/mcp"})
+
+_register_tool_def(
+    "ping",
+    "Connectivity test for the MCP endpoint (does not query Sentinel).",
+    {}
+)
+
+@mcp.tool
+def ping() -> dict:
+    return _ok({
+        "message": "pong",
+        "workspace_configured": bool(WORKSPACE_ID),
+        "catalog_loaded": bool(WORKSPACE_TABLE_CATALOG),
+        "mcp_path": "/mcp",
+    })
+
+_register_tool_def(
+    "debug_identity",
+    "Shows whether managed identity environment variables are present.",
+    {}
+)
+
+@mcp.tool
+def debug_identity() -> dict:
+    return _ok({
+        "IDENTITY_ENDPOINT_present": bool(os.environ.get("IDENTITY_ENDPOINT")),
+        "IDENTITY_HEADER_present": bool(os.environ.get("IDENTITY_HEADER")),
+        "MSI_ENDPOINT_present": bool(os.environ.get("MSI_ENDPOINT")),
+        "MSI_SECRET_present": bool(os.environ.get("MSI_SECRET")),
+        "MANAGED_IDENTITY_CLIENT_ID_present": bool(os.environ.get("MANAGED_IDENTITY_CLIENT_ID")),
+    })
+
+_register_tool_def(
+    "get_workspace_table_catalog",
+    "Returns the catalog of workspace tables grouped by telemetry type.",
+    {}
+)
+
+@mcp.tool
+def get_workspace_table_catalog() -> dict:
+    if not WORKSPACE_TABLE_CATALOG:
+        return _fail("Workspace table catalog not loaded", code="CATALOG_NOT_LOADED")
+    return _ok({"catalog": WORKSPACE_TABLE_CATALOG})
+
+_register_tool_def(
+    "debug_catalog_loaded",
+    "Returns whether the workspace catalog loaded and which keys are present.",
+    {}
+)
+
+@mcp.tool
+def debug_catalog_loaded() -> dict:
+    return _ok({
+        "loaded": bool(WORKSPACE_TABLE_CATALOG),
+        "keys": list(WORKSPACE_TABLE_CATALOG.keys())
+    })
+
+_register_tool_def(
+    "list_workspace_tables",
+    "Returns all unique tables from the workspace table catalog.",
+    {}
+)
+
+@mcp.tool
+def list_workspace_tables() -> dict:
+    if not WORKSPACE_TABLE_CATALOG:
+        return _fail("Workspace table catalog not loaded", code="CATALOG_NOT_LOADED")
+    return _ok({"tables": _flatten_catalog_tables()})
+
+_register_tool_def(
+    "list_tables",
+    "Lists tables that ingested data within the given timespan using the Usage table.",
+    {"timespan": "ISO8601 duration like P1D, PT6H, PT24H"}
+)
+
+@mcp.tool
+def list_tables(timespan: str = DEFAULT_TIMESPAN) -> dict:
+    try:
+        _ = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
+
+    kql = """
+Usage
+| where Quantity > 0
+| summarize Count=sum(Quantity) by DataType
+| order by Count desc
+| take 50
+""".strip()
+
+    res = la_query(kql, timespan)
+    if not res.get("ok"):
+        return res
+
+    payload = res["data"]
+    columns, rows = _la_first_table_rows(payload)
+
+    if not columns:
+        return _fail("No tables returned from Log Analytics", code="EMPTY_RESULT", timespan=timespan)
+
+    if "DataType" not in columns:
+        return _fail("Unexpected response shape: DataType column not present", code="PARSE_ERROR", timespan=timespan)
+
+    idx = columns.index("DataType")
+    return _ok({"tables": [row[idx] for row in rows]}, timespan=timespan)
+
+_register_tool_def(
+    "preview_table",
+    "Shows a small preview (10 rows) from the specified table.",
+    {"table": "Table name string", "timespan": "ISO8601 duration"}
+)
+
+@mcp.tool
+def preview_table(table: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
     try:
         table = validate_table_name(table)
-    except ValueError as exc:
-        return fail("VALIDATION_ERROR", str(exc))
-    return la_query(settings, f"{table}\n| take 10", timespan)
+        _ = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid input", code="VALIDATION_ERROR", detail=str(e))
 
+    kql = f"{table} | take 10"
+    return la_query(kql, timespan)
 
-def service_get_table_schema(settings: Settings, table: str, timespan: str) -> dict:
+_register_tool_def(
+    "get_table_schema",
+    "Retrieves the schema (columns and types) for the specified table.",
+    {"table": "Table name string", "timespan": "ISO8601 duration"}
+)
+
+@mcp.tool
+def get_table_schema(table: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
     try:
         table = validate_table_name(table)
-    except ValueError as exc:
-        return fail("VALIDATION_ERROR", str(exc))
-    return la_query(settings, f"{table}\n| getschema", timespan)
+        _ = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid input", code="VALIDATION_ERROR", detail=str(e))
 
+    kql = f"{table} | getschema"
+    return la_query(kql, timespan)
 
-# ============================================================
-# SERVICE: CMDB
-# ============================================================
+_register_tool_def(
+    "run_query",
+    "Runs a bounded KQL query for the given timespan and returns up to max_rows rows.",
+    {"kql": "KQL string", "timespan": "ISO8601 duration", "max_rows": "integer <= 200"}
+)
 
-def service_enrich_asset(settings: Settings, catalog: WorkspaceCatalog, value: str, timespan: str) -> dict:
-    cmdb_tables = catalog.cmdb_tables()
-    if not cmdb_tables:
-        return ok({
-            "entity": value,
-            "asset_context": [],
-            "message": "No CMDB table category is configured in the workspace catalog.",
+@mcp.tool
+def run_query(kql: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAULT_ROWS) -> dict:
+    if not kql or not isinstance(kql, str):
+        return _fail("kql is required", code="VALIDATION_ERROR")
+
+    try:
+        kql_safety_check(kql)
+        hours = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid query input", code="VALIDATION_ERROR", detail=str(e))
+
+    if hours <= 0 or hours > MAX_HOURS_RUN_QUERY:
+        return _fail(
+            f"Timespan exceeds allowed window ({MAX_HOURS_RUN_QUERY}h max)",
+            code="VALIDATION_ERROR",
+            detail=f"got {hours}h"
+        )
+
+    bounded_kql = ensure_take_limit(kql, clamp_rows(max_rows))
+    return la_query(bounded_kql, timespan)
+
+_register_tool_def(
+    "list_analytics_rules",
+    "Lists Microsoft Sentinel analytics rules in the configured workspace.",
+    {"top": "optional int; max rules to return (default 50, hard cap 200)"}
+)
+
+@mcp.tool
+def list_analytics_rules(top: int = 50) -> dict:
+    if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
+        return _fail(
+            "SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
+            code="CONFIG_ERROR"
+        )
+
+    try:
+        top_i = int(top)
+    except Exception:
+        top_i = 50
+    top_i = max(1, min(top_i, 200))
+
+    base = _sentinel_rules_base_url()
+    url = f"{base}?api-version=2023-09-01-preview"
+
+    res = _arm_get(url)
+    if not res.get("ok"):
+        return res
+
+    items = res["data"].get("value") or []
+
+    out = []
+    for it in items[:top_i]:
+        props = it.get("properties") or {}
+        out.append({
+            "rule_id": it.get("name"),
+            "display_name": props.get("displayName"),
+            "kind": it.get("kind"),
+            "enabled": props.get("enabled"),
+            "severity": props.get("severity"),
         })
 
-    table = cmdb_tables[0]
-    safe_value = escape_kql_string(value)
+    return _ok({"count": len(out), "rules": out})
 
-    kql = f"""
+_register_tool_def(
+    "analyze_use_case",
+    "Fetch Sentinel analytic rule by rule_id or rule_name and extract documentation-ready key points.",
+    {
+        "rule_id": "optional: analytic rule ARM resource name/guid",
+        "rule_name": "optional: displayName match (case-insensitive exact match preferred)"
+    }
+)
+
+@mcp.tool
+def analyze_use_case(
+    rule_id: Optional[str] = None,
+    rule_name: Optional[str] = None,
+) -> dict:
+    if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
+        return _fail(
+            "SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
+            code="CONFIG_ERROR"
+        )
+
+    rid = (rule_id or "").strip()
+    rname = (rule_name or "").strip()
+
+    if not rid and not rname:
+        return _fail("Provide rule_id or rule_name", code="VALIDATION_ERROR")
+
+    if not rid and rname:
+        rid = _find_rule_id_by_name(rname) or ""
+        if not rid:
+            return _fail("Rule not found by name", code="NOT_FOUND", detail="Try list_analytics_rules")
+
+    res = _fetch_rule_by_id(rid)
+    if not res.get("ok"):
+        return res
+
+    rule = res["data"] or {}
+    props = rule.get("properties") or {}
+
+    kql = props.get("query") or ""
+    tables = _extract_tables_from_kql(kql)
+    ops = _extract_ops_from_kql(kql)
+    thresholds = _extract_threshold_snippets(kql)
+    entities = _detect_entity_hints(kql)
+
+    doc = {
+        "rule_id": rule.get("name"),
+        "rule_display_name": props.get("displayName"),
+        "description": props.get("description"),
+        "severity": props.get("severity"),
+        "enabled": props.get("enabled"),
+        "kind": rule.get("kind"),
+        "mitre_tactics": props.get("tactics") or [],
+        "mitre_techniques": props.get("techniques") or [],
+        "schedule": {
+            "query_frequency": props.get("queryFrequency"),
+            "query_period": props.get("queryPeriod"),
+        },
+        "trigger": {
+            "operator": props.get("triggerOperator"),
+            "threshold": props.get("triggerThreshold"),
+        },
+        "kql": {
+            "query": kql[:12000],
+            "summary": _kql_one_liner_summary(kql),
+            "tables_used": tables[:25],
+            "operators_used": ops,
+            "threshold_hints": thresholds,
+            "entity_field_hints": entities,
+        },
+    }
+
+    return _ok(doc)
+
+_register_tool_def(
+    "generate_confluence_use_case",
+    "Generate a Confluence-ready documentation page for a Sentinel analytic rule.",
+    {
+        "rule_id": "optional: analytic rule ARM resource name/guid",
+        "rule_name": "optional: displayName match (case-insensitive exact match preferred)"
+    }
+)
+
+@mcp.tool
+def generate_confluence_use_case(
+    rule_id: Optional[str] = None,
+    rule_name: Optional[str] = None,
+) -> dict:
+    if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
+        return _fail(
+            "SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
+            code="CONFIG_ERROR"
+        )
+
+    rid = (rule_id or "").strip()
+    rname = (rule_name or "").strip()
+
+    if not rid and not rname:
+        return _fail("Provide rule_id or rule_name", code="VALIDATION_ERROR")
+
+    if not rid and rname:
+        rid = _find_rule_id_by_name(rname) or ""
+        if not rid:
+            return _fail("Rule not found by name", code="NOT_FOUND")
+
+    res = _fetch_rule_by_id(rid)
+    if not res.get("ok"):
+        return res
+
+    rule = res["data"] or {}
+    props = rule.get("properties") or {}
+    kql = props.get("query") or ""
+
+    doc = {
+        "rule_display_name": props.get("displayName"),
+        "severity": props.get("severity"),
+        "mitre_tactics": props.get("tactics") or [],
+        "mitre_techniques": props.get("techniques") or [],
+        "schedule": {
+            "query_frequency": props.get("queryFrequency"),
+            "query_period": props.get("queryPeriod"),
+        },
+        "kql": {
+            "query": kql,
+            "tables_used": _extract_tables_from_kql(kql),
+            "entity_field_hints": _detect_entity_hints(kql),
+        },
+    }
+
+    html = _build_confluence_html(doc)
+
+    return _ok({
+        "rule_name": props.get("displayName"),
+        "confluence_html": html
+    })
+
+_register_tool_def(
+    "analyze_entity",
+    "SOC-style entity investigation across common Sentinel tables. Supports ip, user, host, domain, hash.",
+    {
+        "value": "Entity string (IP, UPN, hostname, domain, hash, etc.)",
+        "timespan": "ISO8601 duration (PT6H, P1D, P7D)",
+        "max_rows": "integer <= 200"
+    }
+)
+
+@mcp.tool
+def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAULT_ROWS) -> dict:
+    if not value:
+        return _fail("value is required", code="VALIDATION_ERROR")
+
+    try:
+        hours = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
+
+    if hours <= 0 or hours > MAX_HOURS_ANALYZE_ENTITY:
+        return _fail(
+            f"Timespan exceeds allowed window ({MAX_HOURS_ANALYZE_ENTITY}h max)",
+            code="VALIDATION_ERROR",
+            detail=f"got {hours}h"
+        )
+
+    entity_type = detect_entity_type(value)
+    safe_value = escape_kql_string(value)
+    max_rows = clamp_rows(max_rows)
+
+    preferred_domains = _catalog_domains_for_entity(entity_type)
+    preferred_tables = set(_catalog_tables_for_domains(preferred_domains))
+
+    table_map = {
+        "ip": [
+            ("SigninLogs", f'IPAddress == "{safe_value}"'),
+            ("SecurityAlert", f'CompromisedEntity contains "{safe_value}" or tostring(Entities) contains "{safe_value}"'),
+            ("AzureActivity", f'CallerIpAddress == "{safe_value}"'),
+            ("DeviceNetworkEvents", f'RemoteIP == "{safe_value}" or LocalIP == "{safe_value}"'),
+        ],
+        "user": [
+            ("SigninLogs", f'UserPrincipalName =~ "{safe_value}"'),
+            ("SecurityEvent", f'Account =~ "{safe_value}"'),
+            ("AuditLogs", f'tostring(InitiatedBy.user.userPrincipalName) =~ "{safe_value}"'),
+            ("DeviceLogonEvents", f'AccountName =~ "{safe_value}" or InitiatingProcessAccountUpn =~ "{safe_value}"'),
+        ],
+        "domain": [
+            ("DeviceNetworkEvents", f'RemoteUrl contains "{safe_value}"'),
+            ("UrlClickEvents", f'Url contains "{safe_value}"'),
+            ("EmailUrlInfo", f'Url contains "{safe_value}"'),
+        ],
+        "sha256": [
+            ("DeviceFileEvents", f'SHA256 == "{safe_value}"'),
+        ],
+        "sha1": [
+            ("DeviceFileEvents", f'SHA1 == "{safe_value}"'),
+        ],
+        "md5": [
+            ("DeviceFileEvents", f'MD5 == "{safe_value}"'),
+        ],
+        "host": [
+            ("DeviceInfo", f'DeviceName =~ "{safe_value}"'),
+            ("DeviceEvents", f'DeviceName =~ "{safe_value}"'),
+            ("DeviceProcessEvents", f'DeviceName =~ "{safe_value}"'),
+            ("SecurityAlert", f'CompromisedEntity contains "{safe_value}" or tostring(Entities) contains "{safe_value}"'),
+        ],
+    }
+
+    queries = table_map.get(entity_type, [])[:6]
+
+    findings = []
+    total_events = 0
+    risk_score = 0
+    tables_checked = []
+
+    for table, where_clause in queries:
+        if preferred_tables and table not in preferred_tables:
+            continue
+
+        tables_checked.append(table)
+
+        summary_kql = f"""
 {table}
+| where {where_clause}
+| summarize Count=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated)
+""".strip()
+
+        res = la_query(summary_kql, timespan)
+        if not res.get("ok"):
+            continue
+
+        rows = _la_first_table_dicts(res["data"])
+        if not rows:
+            continue
+
+        row = rows[0]
+        count = int(row.get("Count") or 0)
+        first_seen = row.get("FirstSeen")
+        last_seen = row.get("LastSeen")
+
+        if count == 0:
+            continue
+
+        total_events += count
+
+        if count > 100:
+            risk_score += 2
+        elif count > 20:
+            risk_score += 1
+
+        if table in ["SecurityEvent", "AuditLogs", "SecurityAlert"]:
+            risk_score += 1
+
+        findings.append({
+            "table": table,
+            "count": count,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+        })
+
+    cmdb_context = None
+    if entity_type in {"ip", "host", "domain"}:
+        cmdb_table = _find_cmdb_table()
+        if cmdb_table:
+            cmdb_kql = f"""
+{cmdb_table}
 | where tostring(Management_IP) contains "{safe_value}"
     or tostring(FQDN) contains "{safe_value}"
     or tostring(Key) contains "{safe_value}"
@@ -412,295 +1122,332 @@ def service_enrich_asset(settings: Settings, catalog: WorkspaceCatalog, value: s
     or tostring(logsource) contains "{safe_value}"
 | take 10
 """.strip()
+            cmdb_res = la_query(cmdb_kql, timespan)
+            if cmdb_res.get("ok"):
+                cmdb_context = cmdb_res["data"]
 
-    result = la_query(settings, kql, timespan)
-    if not result.get("ok"):
-        return result
+    if risk_score >= 4:
+        risk_level = "High"
+    elif risk_score >= 2:
+        risk_level = "Medium"
+    else:
+        risk_level = "Low"
 
-    return ok({
-        "entity": value,
-        "cmdb_table": table,
-        "asset_context": result.get("data"),
-    })
-
-
-# ============================================================
-# SERVICE: ENTITY INVESTIGATION
-# ============================================================
-
-ENTITY_FIELD_MAP: dict[str, list[tuple[str, str]]] = {
-    "ip": [
-        ("SigninLogs", 'IPAddress == "{value}"'),
-        ("SecurityAlert", 'CompromisedEntity contains "{value}" or tostring(Entities) contains "{value}"'),
-        ("DeviceNetworkEvents", 'RemoteIP == "{value}" or LocalIP == "{value}"'),
-        ("AzureActivity", 'CallerIpAddress == "{value}"'),
-    ],
-    "user": [
-        ("SigninLogs", 'UserPrincipalName =~ "{value}"'),
-        ("IdentityLogonEvents", 'AccountUpn =~ "{value}" or AccountName =~ "{value}"'),
-        ("DeviceLogonEvents", 'AccountName =~ "{value}" or InitiatingProcessAccountUpn =~ "{value}"'),
-        ("OfficeActivity", 'UserId =~ "{value}"'),
-    ],
-    "host": [
-        ("DeviceInfo", 'DeviceName =~ "{value}"'),
-        ("DeviceEvents", 'DeviceName =~ "{value}"'),
-        ("DeviceProcessEvents", 'DeviceName =~ "{value}"'),
-        ("SecurityAlert", 'CompromisedEntity contains "{value}" or tostring(Entities) contains "{value}"'),
-    ],
-    "domain": [
-        ("DeviceNetworkEvents", 'RemoteUrl contains "{value}"'),
-        ("UrlClickEvents", 'Url contains "{value}"'),
-        ("EmailUrlInfo", 'Url contains "{value}"'),
-    ],
-    "sha256": [
-        ("DeviceFileEvents", 'SHA256 == "{value}"'),
-    ],
-    "sha1": [
-        ("DeviceFileEvents", 'SHA1 == "{value}"'),
-    ],
-    "md5": [
-        ("DeviceFileEvents", 'MD5 == "{value}"'),
-    ],
-}
-
-
-def service_investigate_entity(
-    settings: Settings,
-    catalog: WorkspaceCatalog,
-    value: str,
-    timespan: str,
-    max_rows: int,
-) -> dict:
-    if not value:
-        return fail("VALIDATION_ERROR", "value is required")
-
-    try:
-        hours = parse_timespan_to_hours(timespan)
-    except ValueError as exc:
-        return fail("VALIDATION_ERROR", str(exc))
-
-    if hours > settings.max_hours_investigation:
-        return fail(
-            "VALIDATION_ERROR",
-            f"timespan exceeds allowed window ({settings.max_hours_investigation}h max)",
-        )
-
-    entity_type = detect_entity_type(value)
-    safe_value = escape_kql_string(value)
-    domains = catalog.telemetry_domains_for_entity(entity_type)
-    preferred_tables = catalog.tables_for_domains(domains)
-    field_map = ENTITY_FIELD_MAP.get(entity_type, [])
-
-    findings: list[dict[str, Any]] = []
-    queried_tables: list[str] = []
-
-    cmdb_context = None
-    if entity_type in {"ip", "host", "domain"}:
-        cmdb_context = service_enrich_asset(settings, catalog, value, timespan)
-
-    for table_name, where_template in field_map:
-        if table_name not in preferred_tables:
-            continue
-
-        queried_tables.append(table_name)
-        where_clause = where_template.format(value=safe_value)
-        kql = f"""
-{table_name}
-| where {where_clause}
-| summarize Count=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated)
-""".strip()
-
-        result = la_query(settings, kql, timespan)
-        if not result.get("ok"):
-            continue
-
-        rows = parse_la_rows(result)
-        if not rows:
-            continue
-
-        row = rows[0]
-        count = int(row.get("Count", 0) or 0)
-        if count <= 0:
-            continue
-
-        domain = next((d for d in domains if table_name in catalog.get(d)), "unknown")
-        findings.append({
-            "table": table_name,
-            "telemetry_domain": domain,
-            "matched_entity": value,
-            "summary": f"Matched {value} in {table_name}",
-            "count": count,
-            "first_seen": row.get("FirstSeen"),
-            "last_seen": row.get("LastSeen"),
-        })
-
-    return ok({
+    return _ok({
         "entity": value,
         "entity_type": entity_type,
-        "cmdb_context": cmdb_context["data"] if isinstance(cmdb_context, dict) and cmdb_context.get("ok") else None,
-        "telemetry_domains_checked": domains,
-        "tables_queried": queried_tables,
-        "findings": findings,
-        "coverage_note": (
-            "Known structured fields were queried first. "
-            "Add bounded raw-field fallback only if needed."
-        ),
-    }, timespan=timespan, max_rows=max_rows)
+        "timespan": timespan,
+        "telemetry_domains_checked": preferred_domains,
+        "tables_checked": tables_checked,
+        "tables_hit": len(findings),
+        "total_events": total_events,
+        "risk_level": risk_level,
+        "cmdb_context": cmdb_context,
+        "results": findings,
+    })
 
-
-# ============================================================
-# SERVICE: INCIDENT INVESTIGATION
-# ============================================================
-
-def _extract_entities_from_alerts(alert_rows: list[dict[str, Any]]) -> dict[str, list[str]]:
-    users: set[str] = set()
-    ips: set[str] = set()
-    hosts: set[str] = set()
-    domains: set[str] = set()
-
-    for alert in alert_rows:
-        raw_entities = alert.get("Entities")
-        if not raw_entities:
-            continue
-
-        try:
-            entities = json.loads(raw_entities) if isinstance(raw_entities, str) else raw_entities
-        except Exception:
-            continue
-
-        if not isinstance(entities, list):
-            continue
-
-        for entity in entities:
-            if not isinstance(entity, dict):
-                continue
-
-            etype = (entity.get("Type") or "").lower()
-            if etype == "account":
-                name = entity.get("Name") or entity.get("UPNSuffix")
-                if name:
-                    users.add(str(name))
-            elif etype == "ip":
-                address = entity.get("Address")
-                if address:
-                    ips.add(str(address))
-            elif etype in {"host", "machine"}:
-                hostname = entity.get("HostName")
-                if hostname:
-                    hosts.add(str(hostname))
-            elif etype == "dns":
-                domain = entity.get("DomainName")
-                if domain:
-                    domains.add(str(domain))
-
-    return {
-        "users": sorted(users),
-        "ips": sorted(ips),
-        "hosts": sorted(hosts),
-        "domains": sorted(domains),
+_register_tool_def(
+    "get_incident_report",
+    "List Sentinel incidents or generate a SOC incident report. If incident_id is omitted, returns recent incidents.",
+    {
+        "incident_id": "optional: Sentinel incident number or name",
+        "timespan": "ISO8601 duration like P1D, P7D",
+        "top": "optional number of incidents to list (default 10)"
     }
+)
 
+@mcp.tool
+def get_incident_report(
+    incident_id: Optional[str] = None,
+    timespan: str = "P7D",
+    top: int = 50
+) -> dict:
+    try:
+        _ = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
 
-def _risk_classification(incident: dict[str, Any], alerts: list[dict[str, Any]], entities: dict[str, list[str]]) -> dict:
-    score = 0
-    rationale: list[str] = []
+    top = clamp_rows(top)
 
+    if not incident_id:
+        kql = f"""
+SecurityIncident
+| where Severity !~ "Informational"
+| sort by CreatedTime desc
+| project IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime
+| take {top}
+""".strip()
+
+        res = la_query(kql, timespan)
+        if not res.get("ok"):
+            return res
+
+        incidents = _la_first_table_dicts(res["data"])
+        if not incidents:
+            return _fail("No incidents found", code="EMPTY_RESULT")
+
+        return _ok({
+            "mode": "list",
+            "count": len(incidents),
+            "incidents": incidents
+        })
+
+    safe_id = escape_kql_string(str(incident_id))
+
+    kql = f"""
+SecurityIncident
+| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
+| project IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime, AlertIds
+| mv-expand AlertIds
+| extend AlertIdStr = tostring(AlertIds)
+| join kind=leftouter (
+    SecurityAlert
+    | project
+        SystemAlertId,
+        AlertName = ProductName,
+        AlertComponent = ProductComponentName,
+        AlertStatus = Status,
+        AlertTime = StartTime,
+        CompromisedEntity,
+        Tactics,
+        Techniques,
+        Entities
+    | extend AlertIdStr = tostring(SystemAlertId)
+) on AlertIdStr
+| summarize
+    Alerts = countif(isnotempty(AlertIdStr)),
+    AlertNames = make_set(AlertName, 10),
+    AlertComponents = make_set(AlertComponent, 10),
+    AlertStatuses = make_set(AlertStatus, 10),
+    CompromisedEntities = make_set(CompromisedEntity, 10),
+    TacticsSet = make_set(Tactics, 10),
+    TechniquesSet = make_set(Techniques, 10),
+    FirstAlert = min(AlertTime),
+    LastAlert = max(AlertTime)
+    by IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime
+""".strip()
+
+    res = la_query(kql, timespan)
+    if not res.get("ok"):
+        return res
+
+    incidents = _la_first_table_dicts(res["data"])
+    if not incidents:
+        return _fail("Incident not found", code="NOT_FOUND")
+
+    incident = incidents[0]
     severity = (incident.get("Severity") or "").lower()
+
     if severity == "high":
-        score += 4
-        rationale.append("Incident severity is High.")
+        risk = "High"
     elif severity == "medium":
-        score += 2
-        rationale.append("Incident severity is Medium.")
+        risk = "Medium"
     else:
-        score += 1
-        rationale.append("Incident severity is Low or unspecified.")
+        risk = "Low"
 
-    if len(alerts) >= 5:
-        score += 2
-        rationale.append("Incident has 5 or more linked alerts.")
-    if entities.get("ips"):
-        score += 1
-        rationale.append("Incident includes IP entities.")
-    if entities.get("hosts"):
-        score += 1
-        rationale.append("Incident includes host entities.")
-    if entities.get("users"):
-        score += 1
-        rationale.append("Incident includes user entities.")
+    return _ok({
+        "mode": "report",
+        "incident_number": incident.get("IncidentNumber"),
+        "title": incident.get("Title"),
+        "severity": incident.get("Severity"),
+        "status": incident.get("Status"),
+        "owner": incident.get("Owner"),
+        "created_time": incident.get("CreatedTime"),
+        "last_modified": incident.get("LastModifiedTime"),
+        "alerts_count": incident.get("Alerts"),
+        "alert_names": incident.get("AlertNames"),
+        "alert_components": incident.get("AlertComponents"),
+        "alert_statuses": incident.get("AlertStatuses"),
+        "compromised_entities": incident.get("CompromisedEntities"),
+        "tactics": incident.get("TacticsSet"),
+        "techniques": incident.get("TechniquesSet"),
+        "first_alert": incident.get("FirstAlert"),
+        "last_alert": incident.get("LastAlert"),
+        "risk_level": risk
+    })
 
-    if score >= 6:
-        classification = "High"
-    elif score >= 3:
-        classification = "Medium"
-    else:
-        classification = "Low"
+_register_tool_def(
+    "investigate_incident",
+    "SOC investigation of a Microsoft Sentinel incident. Extracts alerts, entities, MITRE techniques, and timeline indicators.",
+    {
+        "incident_id": "Sentinel incident number",
+        "timespan": "ISO8601 duration (P1D, P7D)"
+    }
+)
 
-    return {"classification": classification, "rationale": rationale}
+@mcp.tool
+def investigate_incident(incident_id: str, timespan: str = "P7D") -> dict:
+    if not incident_id:
+        return _fail("incident_id is required", code="VALIDATION_ERROR")
 
-
-def service_investigate_incident(settings: Settings, catalog: WorkspaceCatalog, incident_id: int, timespan: str) -> dict:
     try:
         hours = parse_timespan_to_hours(timespan)
-    except ValueError as exc:
-        return fail("VALIDATION_ERROR", str(exc))
+    except Exception as e:
+        return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
 
-    if hours > settings.max_hours_investigation:
-        return fail(
-            "VALIDATION_ERROR",
-            f"timespan exceeds allowed window ({settings.max_hours_investigation}h max)",
+    if hours <= 0 or hours > MAX_HOURS_INCIDENT:
+        return _fail(
+            f"Timespan exceeds allowed window ({MAX_HOURS_INCIDENT}h max)",
+            code="VALIDATION_ERROR",
+            detail=f"got {hours}h"
         )
+
+    safe_id = escape_kql_string(str(incident_id))
 
     incident_kql = f"""
 SecurityIncident
-| where IncidentNumber == {incident_id}
+| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
 | where Severity !~ "Informational"
 | project IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime, AlertIds
 """.strip()
 
-    incident_result = la_query(settings, incident_kql, timespan)
-    if not incident_result.get("ok"):
-        return incident_result
+    inc_res = la_query(incident_kql, timespan)
+    if not inc_res.get("ok"):
+        return inc_res
 
-    incident_rows = parse_la_rows(incident_result)
+    incident_rows = _la_first_table_dicts(inc_res["data"])
     if not incident_rows:
-        return fail("NOT_FOUND", f"Incident {incident_id} was not found")
+        return _fail("Incident not found", code="NOT_FOUND")
 
     incident = incident_rows[0]
     alert_ids = incident.get("AlertIds") or []
+
     if isinstance(alert_ids, str):
         try:
             alert_ids = json.loads(alert_ids)
         except Exception:
             alert_ids = []
 
-    alerts: list[dict[str, Any]] = []
-    if alert_ids:
-        safe_ids = ",".join([f'"{escape_kql_string(str(a))}"' for a in alert_ids])
-        alerts_kql = f"""
+    if not alert_ids:
+        return _ok({
+            "incident": incident,
+            "alerts": [],
+            "entities": {},
+            "timeline": {},
+            "mitre": {},
+            "risk_level": "Low",
+            "assessment": "Incident has no linked alerts"
+        })
+
+    safe_alerts = [escape_kql_string(str(a)) for a in alert_ids if a]
+    alert_list = ",".join([f'"{a}"' for a in safe_alerts])
+
+    alerts_kql = f"""
 SecurityAlert
-| where SystemAlertId in ({safe_ids})
-| project AlertName=ProductName, Component=ProductComponentName, AlertTime=StartTime, Status, CompromisedEntity, Tactics, Techniques, Entities
+| where SystemAlertId in ({alert_list})
+| project
+    AlertName = ProductName,
+    Component = ProductComponentName,
+    AlertTime = StartTime,
+    Status,
+    CompromisedEntity,
+    Tactics,
+    Techniques,
+    Entities
 """.strip()
 
-        alert_result = la_query(settings, alerts_kql, timespan)
-        if alert_result.get("ok"):
-            alerts = parse_la_rows(alert_result)
+    alert_res = la_query(alerts_kql, timespan)
+    if not alert_res.get("ok"):
+        return alert_res
 
-    entities = _extract_entities_from_alerts(alerts)
+    alerts = _la_first_table_dicts(alert_res["data"])
 
-    cmdb_context: list[dict[str, Any]] = []
-    for pivot in entities["ips"][:3] + entities["hosts"][:3] + entities["domains"][:3]:
-        cmdb_result = service_enrich_asset(settings, catalog, pivot, timespan)
-        if cmdb_result.get("ok"):
-            cmdb_context.append(cmdb_result["data"])
+    users = set()
+    ips = set()
+    hosts = set()
+    domains = set()
+
+    for alert in alerts:
+        entities = alert.get("Entities")
+        if not entities:
+            continue
+
+        try:
+            ent_list = json.loads(entities) if isinstance(entities, str) else entities
+        except Exception:
+            continue
+
+        if not isinstance(ent_list, list):
+            continue
+
+        for e in ent_list:
+            if not isinstance(e, dict):
+                continue
+
+            etype = (e.get("Type") or "").lower()
+
+            if etype == "account":
+                if e.get("Name"):
+                    users.add(e.get("Name"))
+
+            elif etype == "ip":
+                if e.get("Address"):
+                    ips.add(e.get("Address"))
+
+            elif etype in ["host", "machine"]:
+                if e.get("HostName"):
+                    hosts.add(e.get("HostName"))
+
+            elif etype == "dns":
+                if e.get("DomainName"):
+                    domains.add(e.get("DomainName"))
 
     alert_times = [a.get("AlertTime") for a in alerts if a.get("AlertTime")]
+    first_alert = min(alert_times) if alert_times else None
+    last_alert = max(alert_times) if alert_times else None
+
     tactics = sorted({a.get("Tactics") for a in alerts if a.get("Tactics")})
     techniques = sorted({a.get("Techniques") for a in alerts if a.get("Techniques")})
-    risk = _risk_classification(incident, alerts, entities)
 
-    return ok({
+    cmdb_context = []
+    cmdb_table = _find_cmdb_table()
+
+    if cmdb_table:
+        for pivot in list(ips)[:3] + list(hosts)[:3] + list(domains)[:3]:
+            safe_pivot = escape_kql_string(str(pivot))
+            cmdb_kql = f"""
+{cmdb_table}
+| where tostring(Management_IP) contains "{safe_pivot}"
+    or tostring(FQDN) contains "{safe_pivot}"
+    or tostring(Key) contains "{safe_pivot}"
+    or tostring(Network_Interfaces) contains "{safe_pivot}"
+    or tostring(logsource) contains "{safe_pivot}"
+| take 10
+""".strip()
+            cmdb_res = la_query(cmdb_kql, timespan)
+            if cmdb_res.get("ok"):
+                cmdb_context.append({
+                    "entity": pivot,
+                    "result": cmdb_res["data"]
+                })
+
+    risk_score = 0
+    sev = (incident.get("Severity") or "").lower()
+
+    if sev == "high":
+        risk_score += 4
+    elif sev == "medium":
+        risk_score += 2
+    else:
+        risk_score += 1
+
+    if len(alerts) > 5:
+        risk_score += 2
+    if ips:
+        risk_score += 1
+    if users:
+        risk_score += 1
+    if hosts:
+        risk_score += 1
+
+    if risk_score >= 6:
+        risk_level = "High"
+    elif risk_score >= 3:
+        risk_level = "Medium"
+    else:
+        risk_level = "Low"
+
+    return _ok({
         "incident": {
             "id": incident.get("IncidentNumber"),
             "title": incident.get("Title"),
@@ -715,320 +1462,26 @@ SecurityAlert
             "names": sorted({a.get("AlertName") for a in alerts if a.get("AlertName")}),
             "components": sorted({a.get("Component") for a in alerts if a.get("Component")}),
         },
-        "entities": entities,
+        "entities": {
+            "users": sorted(users),
+            "ips": sorted(ips),
+            "hosts": sorted(hosts),
+            "domains": sorted(domains),
+        },
         "timeline": {
-            "first_alert": min(alert_times) if alert_times else None,
-            "last_alert": max(alert_times) if alert_times else None,
+            "first_alert": first_alert,
+            "last_alert": last_alert,
         },
         "mitre": {
             "tactics": tactics,
             "techniques": techniques,
         },
         "asset_context": cmdb_context,
-        "telemetry_domains_checked": [
-            "alerts_and_incidents",
-            "cmdb_and_asset_context",
-        ],
-        "risk": risk,
-        "recommended_next_steps": [
-            "Validate the most suspicious entities across identity, endpoint, and network telemetry.",
-            "Review linked alerts for repeated indicators and pivot from confirmed entities only.",
-            "Escalate if critical assets or privileged accounts are involved.",
-        ],
-    }, timespan=timespan)
-
-
-# ============================================================
-# SERVICE: ANALYTIC RULES
-# ============================================================
-
-ANALYTICS_API_VERSION = "2024-01-01-preview"
-
-
-def _rules_path(settings: Settings) -> str:
-    return (
-        f"/subscriptions/{settings.subscription_id}"
-        f"/resourceGroups/{settings.resource_group}"
-        f"/providers/Microsoft.OperationalInsights/workspaces/{settings.workspace_name}"
-        f"/providers/Microsoft.SecurityInsights/alertRules"
-    )
-
-
-def service_list_analytic_rules(settings: Settings, limit: int = 50) -> dict:
-    result = arm_get(settings, _rules_path(settings), ANALYTICS_API_VERSION)
-    if not result.get("ok"):
-        return result
-
-    value = (result.get("data") or {}).get("value") or []
-    out = []
-    for item in value[:limit]:
-        props = item.get("properties") or {}
-        if props.get("kind") != "Scheduled":
-            continue
-        out.append({
-            "id": item.get("id"),
-            "name": item.get("name"),
-            "display_name": props.get("displayName"),
-            "severity": props.get("severity"),
-            "enabled": props.get("enabled"),
-            "query_frequency": props.get("queryFrequency"),
-            "query_period": props.get("queryPeriod"),
-        })
-
-    return ok({"rules": out})
-
-
-def service_get_analytic_rule(settings: Settings, rule_id: str) -> dict:
-    if not rule_id:
-        return fail("VALIDATION_ERROR", "rule_id is required")
-
-    path = f"{_rules_path(settings)}/{rule_id}"
-    result = arm_get(settings, path, ANALYTICS_API_VERSION)
-    if not result.get("ok"):
-        return result
-    return ok({"rule": result.get("data")})
-
-
-def _extract_tables_from_kql(kql: str) -> list[str]:
-    if not kql:
-        return []
-    candidates = re.findall(r"(?m)^\s*([A-Za-z][A-Za-z0-9_]*)\s*\|", kql)
-    seen: set[str] = set()
-    tables: list[str] = []
-    for name in candidates:
-        if name not in seen:
-            seen.add(name)
-            tables.append(name)
-    return tables
-
-
-def _extract_ops_from_kql(kql: str) -> list[str]:
-    if not kql:
-        return []
-    ops = [
-        "where", "summarize", "join", "extend", "project",
-        "project-away", "parse", "mv-expand", "evaluate",
-        "union", "lookup", "distinct",
-    ]
-    lowered = kql.lower()
-    return [op for op in ops if re.search(rf"\b{re.escape(op)}\b", lowered)]
-
-
-def service_generate_use_case_document(settings: Settings, rule_id: str) -> dict:
-    rule_result = service_get_analytic_rule(settings, rule_id)
-    if not rule_result.get("ok"):
-        return rule_result
-
-    rule = (rule_result.get("data") or {}).get("rule") or {}
-    props = rule.get("properties") or {}
-    query = props.get("query") or ""
-
-    return ok({
-        "rule_name": props.get("displayName"),
-        "severity": props.get("severity"),
-        "description": props.get("description"),
-        "query_frequency": props.get("queryFrequency"),
-        "query_period": props.get("queryPeriod"),
-        "tactics": props.get("tactics") or [],
-        "techniques": props.get("techniques") or [],
-        "tables": _extract_tables_from_kql(query),
-        "operators": _extract_ops_from_kql(query),
-        "query": query,
+        "risk_level": risk_level
     })
 
-
 # ============================================================
-# SERVICE: RAW KQL
+# EXPORT ASGI APP
 # ============================================================
-
-def service_run_kql(settings: Settings, kql: str, timespan: str, max_rows: int) -> dict:
-    if not settings.enable_run_kql:
-        return fail("FEATURE_DISABLED", "run_kql is disabled")
-
-    if not kql or not isinstance(kql, str):
-        return fail("VALIDATION_ERROR", "kql is required")
-
-    try:
-        kql_safety_check(kql)
-        hours = parse_timespan_to_hours(timespan)
-    except ValueError as exc:
-        return fail("VALIDATION_ERROR", str(exc))
-
-    if hours > settings.max_hours_run_query:
-        return fail(
-            "VALIDATION_ERROR",
-            f"timespan exceeds allowed window ({settings.max_hours_run_query}h max)",
-        )
-
-    bounded = ensure_take_limit(kql, clamp_rows(max_rows, settings.max_rows_hard))
-    return la_query(settings, bounded, timespan)
-
-
-# ============================================================
-# MCP APP
-# ============================================================
-
-settings = get_settings()
-catalog = WorkspaceCatalog(settings.catalog_path)
-mcp = FastMCP("SentinelMCPEnterprise")
-_TOOL_DEFS: list[dict[str, Any]] = []
-
-
-@mcp.tool
-def ping() -> dict:
-    """Simple MCP health check."""
-    return ok({
-        "message": "pong",
-        "workspace_configured": bool(settings.workspace_id),
-        "catalog_loaded": bool(catalog.data),
-        "missing_settings": validate_required_settings(settings),
-        "mcp_path": "/mcp",
-    })
-
-
-_TOOL_DEFS.append({
-    "name": "ping",
-    "description": "Connectivity and configuration health check.",
-    "params": {},
-})
-
-
-@mcp.tool
-def get_tools() -> dict:
-    """Returns the exact MCP tool list and parameter formats."""
-    return ok({"tools": _TOOL_DEFS, "mcp_path": "/mcp"})
-
-
-_TOOL_DEFS.append({
-    "name": "get_tools",
-    "description": "Returns the exact MCP tool list and parameter formats.",
-    "params": {},
-})
-
-
-@mcp.tool
-def get_workspace_catalog() -> dict:
-    """Return the authoritative workspace table catalog grouped by telemetry type."""
-    return service_get_workspace_catalog(catalog)
-
-
-_TOOL_DEFS.append({
-    "name": "get_workspace_catalog",
-    "description": "Returns the authoritative workspace table catalog grouped by telemetry type.",
-    "params": {},
-})
-
-
-@mcp.tool
-def preview_table(table: str, timespan: str = settings.default_timespan) -> dict:
-    """Preview 10 rows from a table."""
-    return service_preview_table(settings, table, timespan)
-
-
-_TOOL_DEFS.append({
-    "name": "preview_table",
-    "description": "Preview 10 rows from a table. Use for troubleshooting or field inspection.",
-    "params": {"table": "Table name", "timespan": "ISO8601 duration"},
-})
-
-
-@mcp.tool
-def get_table_schema(table: str, timespan: str = settings.default_timespan) -> dict:
-    """Get schema for a table before writing KQL against it."""
-    return service_get_table_schema(settings, table, timespan)
-
-
-_TOOL_DEFS.append({
-    "name": "get_table_schema",
-    "description": "Returns the schema for a table. Use before querying unknown tables.",
-    "params": {"table": "Table name", "timespan": "ISO8601 duration"},
-})
-
-
-@mcp.tool
-def investigate_incident(incident_id: int, timespan: str = "P7D") -> dict:
-    """
-    Full Sentinel incident investigation.
-    Retrieves incident details, linked alerts, entities, CMDB context, timeline, and risk.
-    """
-    return service_investigate_incident(settings, catalog, incident_id, timespan)
-
-
-_TOOL_DEFS.append({
-    "name": "investigate_incident",
-    "description": "Use for a full Sentinel incident investigation. Best for incident number-led workflows.",
-    "params": {"incident_id": "Sentinel incident number", "timespan": "ISO8601 duration"},
-})
-
-
-@mcp.tool
-def investigate_entity(value: str, timespan: str = "P3D", max_rows: int = 50) -> dict:
-    """
-    Structured entity investigation across telemetry domains selected from the workspace catalog.
-    """
-    return service_investigate_entity(settings, catalog, value, timespan, max_rows)
-
-
-_TOOL_DEFS.append({
-    "name": "investigate_entity",
-    "description": "Use for IP, hostname, user, domain, or hash investigations across relevant telemetry domains.",
-    "params": {"value": "Entity value", "timespan": "ISO8601 duration", "max_rows": "Integer <= hard limit"},
-})
-
-
-@mcp.tool
-def list_analytic_rules(limit: int = 50) -> dict:
-    """List Microsoft Sentinel scheduled analytic rules."""
-    return service_list_analytic_rules(settings, limit)
-
-
-_TOOL_DEFS.append({
-    "name": "list_analytic_rules",
-    "description": "Lists Microsoft Sentinel scheduled analytic rules.",
-    "params": {"limit": "Maximum number of rules to return"},
-})
-
-
-@mcp.tool
-def get_analytic_rule(rule_id: str) -> dict:
-    """Get a specific analytic rule by ARM rule name/id segment."""
-    return service_get_analytic_rule(settings, rule_id)
-
-
-_TOOL_DEFS.append({
-    "name": "get_analytic_rule",
-    "description": "Returns a specific Microsoft Sentinel analytic rule.",
-    "params": {"rule_id": "Rule ARM name/id segment"},
-})
-
-
-@mcp.tool
-def generate_use_case_document(rule_id: str) -> dict:
-    """Generate a structured use-case document from a Sentinel analytic rule."""
-    return service_generate_use_case_document(settings, rule_id)
-
-
-_TOOL_DEFS.append({
-    "name": "generate_use_case_document",
-    "description": "Generates a use-case style document from an analytic rule.",
-    "params": {"rule_id": "Rule ARM name/id segment"},
-})
-
-
-@mcp.tool
-def run_kql(kql: str, timespan: str = "P1D", max_rows: int = 50) -> dict:
-    """
-    Expert KQL fallback tool.
-    Use only when a structured tool cannot answer the question.
-    """
-    return service_run_kql(settings, kql, timespan, max_rows)
-
-
-_TOOL_DEFS.append({
-    "name": "run_kql",
-    "description": "Expert fallback for bounded KQL execution. Prefer structured tools first.",
-    "params": {"kql": "KQL string", "timespan": "ISO8601 duration", "max_rows": "Integer <= hard limit"},
-})
-
 
 asgi_app = mcp.http_app(path="/mcp", stateless_http=True)
