@@ -356,12 +356,36 @@ def _catalog_tables_for_domains(domains: List[str]) -> List[str]:
                 out.append(table)
     return out
 
-def _find_cmdb_table() -> Optional[str]:
-    for key, tables in WORKSPACE_TABLE_CATALOG.items():
-        if "cmdb" in key.lower() and tables:
-            return tables[0]
-    return None
+CMDB_TABLE = "COVERAGE_CMDB"
 
+def _query_cmdb_entity(value: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
+    safe_value = escape_kql_string(value)
+
+    kql = f"""
+{CMDB_TABLE}
+| where
+    tostring(Key) contains "{safe_value}"
+    or tostring(Management_IP) contains "{safe_value}"
+    or tostring(ApplicationAndComponentInstance) contains "{safe_value}"
+    or tostring(Network_Interfaces) contains "{safe_value}"
+    or tostring(BusinessEntity) contains "{safe_value}"
+    or tostring(FQDN) contains "{safe_value}"
+    or tostring(PSNC) contains "{safe_value}"
+    or tostring(Scanning_Information) contains "{safe_value}"
+| project
+    Key,
+    Management_IP,
+    ApplicationAndComponentInstance,
+    Network_Interfaces,
+    Updated,
+    Scanning_Information,
+    BusinessEntity,
+    FQDN,
+    PSNC
+| take 20
+""".strip()
+
+    return la_query(kql, timespan)
 # ============================================================
 # LOG ANALYTICS / ARM CLIENTS
 # ============================================================
@@ -1111,20 +1135,9 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
 
     cmdb_context = None
     if entity_type in {"ip", "host", "domain"}:
-        cmdb_table = _find_cmdb_table()
-        if cmdb_table:
-            cmdb_kql = f"""
-{cmdb_table}
-| where tostring(Management_IP) contains "{safe_value}"
-    or tostring(FQDN) contains "{safe_value}"
-    or tostring(Key) contains "{safe_value}"
-    or tostring(Network_Interfaces) contains "{safe_value}"
-    or tostring(logsource) contains "{safe_value}"
-| take 10
-""".strip()
-            cmdb_res = la_query(cmdb_kql, timespan)
-            if cmdb_res.get("ok"):
-                cmdb_context = cmdb_res["data"]
+        cmdb_res = _query_cmdb_entity(value, timespan)
+        if cmdb_res.get("ok"):
+            cmdb_context = cmdb_res["data"]
 
     if risk_score >= 4:
         risk_level = "High"
@@ -1400,26 +1413,14 @@ SecurityAlert
     techniques = sorted({a.get("Techniques") for a in alerts if a.get("Techniques")})
 
     cmdb_context = []
-    cmdb_table = _find_cmdb_table()
 
-    if cmdb_table:
-        for pivot in list(ips)[:3] + list(hosts)[:3] + list(domains)[:3]:
-            safe_pivot = escape_kql_string(str(pivot))
-            cmdb_kql = f"""
-{cmdb_table}
-| where tostring(Management_IP) contains "{safe_pivot}"
-    or tostring(FQDN) contains "{safe_pivot}"
-    or tostring(Key) contains "{safe_pivot}"
-    or tostring(Network_Interfaces) contains "{safe_pivot}"
-    or tostring(logsource) contains "{safe_pivot}"
-| take 10
-""".strip()
-            cmdb_res = la_query(cmdb_kql, timespan)
-            if cmdb_res.get("ok"):
-                cmdb_context.append({
-                    "entity": pivot,
-                    "result": cmdb_res["data"]
-                })
+    for pivot in list(ips)[:3] + list(hosts)[:3] + list(domains)[:3]:
+        cmdb_res = _query_cmdb_entity(str(pivot), timespan)
+        if cmdb_res.get("ok"):
+            cmdb_context.append({
+                "entity": pivot,
+                "result": cmdb_res["data"]
+            })
 
     risk_score = 0
     sev = (incident.get("Severity") or "").lower()
