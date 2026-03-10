@@ -361,7 +361,7 @@ CMDB_TABLE = "COVERAGE_CMDB"
 def _query_cmdb_entity(value: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
     safe_value = escape_kql_string(value)
 
-    kql = f"""
+    structured_kql = f"""
 {CMDB_TABLE}
 | where
     tostring(Key) contains "{safe_value}"
@@ -372,6 +372,7 @@ def _query_cmdb_entity(value: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
     or tostring(FQDN) contains "{safe_value}"
     or tostring(PSNC) contains "{safe_value}"
     or tostring(Scanning_Information) contains "{safe_value}"
+    or tostring(logsource) contains "{safe_value}"
 | project
     Key,
     Management_IP,
@@ -381,11 +382,37 @@ def _query_cmdb_entity(value: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
     Scanning_Information,
     BusinessEntity,
     FQDN,
-    PSNC
+    PSNC,
+    logsource
 | take 20
 """.strip()
 
-    return la_query(kql, timespan)
+    res = la_query(structured_kql, timespan)
+    if not res.get("ok"):
+        return res
+
+    rows = _la_first_table_dicts(res["data"])
+    if rows:
+        return res
+
+    fallback_kql = f"""
+{CMDB_TABLE}
+| where tostring(*) contains "{safe_value}"
+| project
+    Key,
+    Management_IP,
+    ApplicationAndComponentInstance,
+    Network_Interfaces,
+    Updated,
+    Scanning_Information,
+    BusinessEntity,
+    FQDN,
+    PSNC,
+    logsource
+| take 20
+""".strip()
+
+    return la_query(fallback_kql, timespan)
 # ============================================================
 # LOG ANALYTICS / ARM CLIENTS
 # ============================================================
