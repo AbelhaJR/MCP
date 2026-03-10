@@ -1536,6 +1536,168 @@ SecurityAlert
         "risk_level": risk_level
     })
 
+_register_tool_def(
+    "get_similar_incident_history",
+    "Looks up incidents from the last N days with the same title as the target incident and returns prior classifications, comments, and status history for triage context.",
+    {
+        "incident_id": "Sentinel incident number",
+        "days": "optional integer, default 30"
+    }
+)
+@mcp.tool
+def get_similar_incident_history(incident_id: str, days: int = 30) -> dict:
+    """
+    Retrieve prior incidents with the same or similar title over the last N days.
+    Exact normalized title match is attempted first; if no rows are found,
+    a normalized contains match is used as fallback.
+    """
+
+    if not incident_id:
+        return _fail("incident_id is required", code="VALIDATION_ERROR")
+
+    try:
+        days_i = int(days)
+    except Exception:
+        days_i = 30
+
+    days_i = max(1, min(days_i, 90))
+    safe_id = escape_kql_string(str(incident_id).strip())
+
+    # --------------------------------------------------
+    # STEP 1 - Get the reference incident and its title
+    # --------------------------------------------------
+    current_kql = f"""
+SecurityIncident
+| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| project IncidentNumber, IncidentName, Title, Severity, Status, CreatedTime, LastModifiedTime
+""".strip()
+
+    current_res = la_query(current_kql, f"P{days_i}D")
+    if not current_res.get("ok"):
+        return current_res
+
+    current_rows = _la_first_table_dicts(current_res["data"])
+    if not current_rows:
+        return _fail("Incident not found", code="NOT_FOUND")
+
+    current_incident = current_rows[0]
+    title = current_incident.get("Title")
+
+    if not title or not str(title).strip():
+        return _fail("Incident title not found", code="PARSE_ERROR")
+
+    normalized_title = str(title).strip().lower()
+    safe_title = escape_kql_string(normalized_title)
+
+    # --------------------------------------------------
+    # STEP 2 - Exact normalized title match first
+    # --------------------------------------------------
+    exact_kql = f"""
+SecurityIncident
+| where CreatedTime >= ago({days_i}d)
+| where Severity !~ "Informational"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| extend NormalizedTitle = tolower(trim(@" ", tostring(Title)))
+| where NormalizedTitle == "{safe_title}"
+| project
+    IncidentNumber,
+    IncidentName,
+    Title,
+    Severity,
+    Status,
+    Classification,
+    ClassificationReason,
+    ClassificationComment,
+    Owner,
+    CreatedTime,
+    LastModifiedTime,
+    ModifiedBy,
+    Labels,
+    AdditionalData,
+    Tasks,
+    IncidentUrl
+| order by CreatedTime desc
+""".strip()
+
+    exact_res = la_query(exact_kql, f"P{days_i}D")
+    if not exact_res.get("ok"):
+        return exact_res
+
+    exact_incidents = _la_first_table_dicts(exact_res["data"])
+
+    match_mode = "exact_normalized_title"
+
+    # --------------------------------------------------
+    # STEP 3 - Fallback to contains match if needed
+    # --------------------------------------------------
+    if exact_incidents:
+        incidents = exact_incidents
+    else:
+        contains_kql = f"""
+SecurityIncident
+| where CreatedTime >= ago({days_i}d)
+| where Severity !~ "Informational"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| extend NormalizedTitle = tolower(trim(@" ", tostring(Title)))
+| where NormalizedTitle contains "{safe_title}"
+| project
+    IncidentNumber,
+    IncidentName,
+    Title,
+    Severity,
+    Status,
+    Classification,
+    ClassificationReason,
+    ClassificationComment,
+    Owner,
+    CreatedTime,
+    LastModifiedTime,
+    ModifiedBy,
+    Labels,
+    AdditionalData,
+    Tasks,
+    IncidentUrl
+| order by CreatedTime desc
+""".strip()
+
+        contains_res = la_query(contains_kql, f"P{days_i}D")
+        if not contains_res.get("ok"):
+            return contains_res
+
+        incidents = _la_first_table_dicts(contains_res["data"])
+        match_mode = "contains_normalized_title"
+
+    # --------------------------------------------------
+    # STEP 4 - Build simple recurrence summary
+    # --------------------------------------------------
+    classification_summary: Dict[str, int] = {}
+    status_summary: Dict[str, int] = {}
+
+    for inc in incidents:
+        cls = str(inc.get("Classification") or "Unclassified")
+        st = str(inc.get("Status") or "Unknown")
+
+        classification_summary[cls] = classification_summary.get(cls, 0) + 1
+        status_summary[st] = status_summary.get(st, 0) + 1
+
+    return _ok({
+        "reference_incident": {
+            "incident_number": current_incident.get("IncidentNumber"),
+            "incident_name": current_incident.get("IncidentName"),
+            "title": current_incident.get("Title"),
+            "severity": current_incident.get("Severity"),
+            "status": current_incident.get("Status"),
+            "created_time": current_incident.get("CreatedTime"),
+            "last_modified_time": current_incident.get("LastModifiedTime"),
+        },
+        "days_reviewed": days_i,
+        "match_mode": match_mode,
+        "count": len(incidents),
+        "classification_summary": classification_summary,
+        "status_summary": status_summary,
+        "incidents": incidents,
+    })
 # ============================================================
 # EXPORT ASGI APP
 # ============================================================
