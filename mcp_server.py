@@ -59,6 +59,9 @@ HTTP_TIMEOUT_SECONDS = int(os.environ.get("LA_HTTP_TIMEOUT", "15"))
 MAX_HOURS_RUN_QUERY = 72
 MAX_HOURS_ANALYZE_ENTITY = 168
 MAX_HOURS_INCIDENT = 168
+DEFAULT_SIMILAR_DAYS = 30
+
+CMDB_TABLE = "COVERAGE_CMDB"
 
 # ============================================================
 # RESPONSE HELPERS
@@ -121,7 +124,6 @@ def get_managed_identity_token(resource: str) -> str:
     identity_header = os.environ.get("IDENTITY_HEADER") or os.environ.get("MSI_SECRET")
     client_id = os.environ.get("MANAGED_IDENTITY_CLIENT_ID")
 
-    # App Service / Function App managed identity endpoint
     if identity_endpoint and identity_header:
         sep = "&" if "?" in identity_endpoint else "?"
         extra = f"&client_id={client_id}" if client_id else ""
@@ -147,7 +149,6 @@ def get_managed_identity_token(resource: str) -> str:
             }
             return token
 
-    # Fallback IMDS
     extra = f"&client_id={client_id}" if client_id else ""
     url = f"{IMDS_ENDPOINT}?api-version=2018-02-01&resource={resource}{extra}"
     req = urllib.request.Request(
@@ -172,15 +173,12 @@ def get_managed_identity_token(resource: str) -> str:
 # ============================================================
 
 _TABLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_HASH_64_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+_HASH_40_RE = re.compile(r"^[a-fA-F0-9]{40}$")
+_HASH_32_RE = re.compile(r"^[a-fA-F0-9]{32}$")
+_IPV4_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}")
 
 def parse_timespan_to_hours(timespan: str) -> float:
-    """
-    Supports:
-      - PT#H
-      - PT#M
-      - PT#H#M
-      - P#D
-    """
     ts = (timespan or "").strip()
 
     m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?", ts)
@@ -260,13 +258,13 @@ def detect_entity_type(value: str) -> str:
     if "@" in v:
         return "user"
 
-    if re.fullmatch(r"[a-fA-F0-9]{64}", v):
+    if _HASH_64_RE.fullmatch(v):
         return "sha256"
 
-    if re.fullmatch(r"[a-fA-F0-9]{40}", v):
+    if _HASH_40_RE.fullmatch(v):
         return "sha1"
 
-    if re.fullmatch(r"[a-fA-F0-9]{32}", v):
+    if _HASH_32_RE.fullmatch(v):
         return "md5"
 
     if "." in v:
@@ -356,7 +354,41 @@ def _catalog_tables_for_domains(domains: List[str]) -> List[str]:
                 out.append(table)
     return out
 
-CMDB_TABLE = "COVERAGE_CMDB"
+def _normalize_title_for_family(title: str) -> str:
+    s = (title or "").strip().lower()
+    s = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<ip>", s)
+    s = re.sub(r"\b[a-f0-9]{32,64}\b", "<hash>", s)
+    s = re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{27,36}\b", "<guid>", s)
+    s = re.sub(r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b", "<user>", s)
+    s = re.sub(r"\b[a-z0-9][a-z0-9._-]{2,}\b", lambda m: m.group(0), s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _entity_priority_score(entity_type: str, value: str) -> int:
+    base = {
+        "host": 5,
+        "ip": 5,
+        "user": 4,
+        "domain": 4,
+        "sha256": 4,
+        "sha1": 4,
+        "md5": 4,
+        "url": 3,
+    }.get(entity_type, 1)
+
+    if value and value != "<unknown>":
+        base += 1
+    return base
+
+def _dedupe_preserve_order(items: List[Any]) -> List[Any]:
+    seen = set()
+    out = []
+    for item in items:
+        key = json.dumps(item, sort_keys=True, default=str) if isinstance(item, (dict, list)) else str(item)
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
 
 def _query_cmdb_entity(value: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
     safe_value = escape_kql_string(value)
@@ -413,6 +445,7 @@ def _query_cmdb_entity(value: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
 """.strip()
 
     return la_query(fallback_kql, timespan)
+
 # ============================================================
 # LOG ANALYTICS / ARM CLIENTS
 # ============================================================
@@ -568,8 +601,7 @@ def _extract_ops_from_kql(kql: str) -> List[str]:
     ops = [
         "where", "summarize", "join", "extend",
         "project", "project-away", "parse",
-        "mv-expand", "evaluate", "union",
-        "lookup", "distinct"
+        "mv-expand", "union", "lookup", "distinct"
     ]
     lowered = kql.lower()
     return [op for op in ops if re.search(rf"\b{re.escape(op)}\b", lowered)]
@@ -681,6 +713,286 @@ def _build_confluence_html(doc: dict) -> str:
         kql=doc.get("kql", {}).get("query", ""),
         entities=entities_html,
     )
+
+# ============================================================
+# INCIDENT / ENTITY HELPERS
+# ============================================================
+
+def _sentinel_incident_latest_kql(safe_id: str) -> str:
+    return f"""
+SecurityIncident
+| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
+| where Severity !~ "Informational"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| project
+    IncidentNumber,
+    IncidentName,
+    Title,
+    Severity,
+    Status,
+    Owner,
+    CreatedTime,
+    LastModifiedTime,
+    Classification,
+    ClassificationReason,
+    ClassificationComment,
+    AlertIds,
+    Labels,
+    AdditionalData
+""".strip()
+
+def _parse_alert_ids(raw_alert_ids: Any) -> List[str]:
+    if raw_alert_ids is None:
+        return []
+    if isinstance(raw_alert_ids, list):
+        return [str(x) for x in raw_alert_ids if x]
+    if isinstance(raw_alert_ids, str):
+        try:
+            parsed = json.loads(raw_alert_ids)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed if x]
+        except Exception:
+            return []
+    return []
+
+def _extract_alert_entities(alerts: List[dict]) -> dict:
+    entity_map = {
+        "users": [],
+        "ips": [],
+        "hosts": [],
+        "domains": [],
+        "hashes": [],
+        "urls": [],
+        "raw": [],
+    }
+
+    for alert in alerts:
+        entities = alert.get("Entities")
+        if not entities:
+            continue
+
+        try:
+            ent_list = json.loads(entities) if isinstance(entities, str) else entities
+        except Exception:
+            continue
+
+        if not isinstance(ent_list, list):
+            continue
+
+        for e in ent_list:
+            if not isinstance(e, dict):
+                continue
+
+            entity_map["raw"].append(e)
+            etype = str(e.get("Type") or "").lower()
+
+            if etype == "account":
+                value = e.get("UPNSuffix")
+                name = e.get("Name")
+                if name and value:
+                    entity_map["users"].append({
+                        "type": "user",
+                        "value": f"{name}@{value}",
+                        "source": "alert_entities",
+                    })
+                elif name:
+                    entity_map["users"].append({
+                        "type": "user",
+                        "value": str(name),
+                        "source": "alert_entities",
+                    })
+
+            elif etype == "ip":
+                if e.get("Address"):
+                    entity_map["ips"].append({
+                        "type": "ip",
+                        "value": str(e.get("Address")),
+                        "source": "alert_entities",
+                    })
+
+            elif etype in ["host", "machine"]:
+                host = e.get("HostName") or e.get("DnsDomain")
+                if e.get("HostName"):
+                    entity_map["hosts"].append({
+                        "type": "host",
+                        "value": str(e.get("HostName")),
+                        "source": "alert_entities",
+                    })
+                if e.get("DnsDomain"):
+                    entity_map["domains"].append({
+                        "type": "domain",
+                        "value": str(e.get("DnsDomain")),
+                        "source": "alert_entities",
+                    })
+
+            elif etype == "dns":
+                if e.get("DomainName"):
+                    entity_map["domains"].append({
+                        "type": "domain",
+                        "value": str(e.get("DomainName")),
+                        "source": "alert_entities",
+                    })
+
+            elif etype == "file":
+                for algo in ["SHA256", "SHA1", "MD5"]:
+                    if e.get(algo):
+                        entity_map["hashes"].append({
+                            "type": algo.lower(),
+                            "value": str(e.get(algo)),
+                            "source": "alert_entities",
+                        })
+
+            elif etype == "url":
+                if e.get("Url"):
+                    entity_map["urls"].append({
+                        "type": "url",
+                        "value": str(e.get("Url")),
+                        "source": "alert_entities",
+                    })
+
+    for key in entity_map:
+        entity_map[key] = _dedupe_preserve_order(entity_map[key])
+
+    return entity_map
+
+def _select_top_entities(entity_map: dict, max_entities: int = 3) -> List[dict]:
+    candidates = []
+    for bucket in ["hosts", "ips", "users", "domains", "hashes", "urls"]:
+        for item in entity_map.get(bucket, []):
+            etype = item.get("type") or detect_entity_type(item.get("value", ""))
+            candidates.append({
+                "type": etype,
+                "value": item.get("value"),
+                "source": item.get("source", "unknown"),
+                "priority": _entity_priority_score(etype, item.get("value", "")),
+            })
+
+    candidates.sort(key=lambda x: (-x["priority"], x["type"], x["value"]))
+    return candidates[:max(1, min(max_entities, 10))]
+
+def _similar_incident_lookup(title: str, days_i: int = DEFAULT_SIMILAR_DAYS) -> dict:
+    normalized_title = _normalize_title_for_family(title)
+    safe_title = escape_kql_string(normalized_title)
+
+    exact_kql = f"""
+SecurityIncident
+| where CreatedTime >= ago({days_i}d)
+| where Severity !~ "Informational"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| extend NormalizedFamilyTitle = tolower(trim(@" ", tostring(Title)))
+| extend NormalizedFamilyTitle = replace_regex(NormalizedFamilyTitle, @"\\b(?:\\d{{1,3}}\\.){{3}}\\d{{1,3}}\\b", "<ip>")
+| extend NormalizedFamilyTitle = replace_regex(NormalizedFamilyTitle, @"\\b[a-f0-9]{{32,64}}\\b", "<hash>")
+| extend NormalizedFamilyTitle = replace_regex(NormalizedFamilyTitle, @"\\b[0-9a-f]{{8}}-[0-9a-f-]{{27,36}}\\b", "<guid>")
+| extend NormalizedFamilyTitle = replace_regex(NormalizedFamilyTitle, @"\\b[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{{2,}}\\b", "<user>")
+| where NormalizedFamilyTitle == "{safe_title}"
+| project
+    IncidentNumber,
+    IncidentName,
+    Title,
+    Severity,
+    Status,
+    Classification,
+    ClassificationReason,
+    ClassificationComment,
+    Owner,
+    CreatedTime,
+    LastModifiedTime,
+    ModifiedBy,
+    Labels,
+    AdditionalData,
+    Tasks,
+    IncidentUrl
+| order by CreatedTime desc
+""".strip()
+
+    exact_res = la_query(exact_kql, f"P{days_i}D")
+    if not exact_res.get("ok"):
+        return exact_res
+
+    incidents = _la_first_table_dicts(exact_res["data"])
+    match_mode = "exact_normalized_family_title"
+
+    if not incidents:
+        contains_kql = f"""
+SecurityIncident
+| where CreatedTime >= ago({days_i}d)
+| where Severity !~ "Informational"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| extend NormalizedFamilyTitle = tolower(trim(@" ", tostring(Title)))
+| extend NormalizedFamilyTitle = replace_regex(NormalizedFamilyTitle, @"\\b(?:\\d{{1,3}}\\.){{3}}\\d{{1,3}}\\b", "<ip>")
+| extend NormalizedFamilyTitle = replace_regex(NormalizedFamilyTitle, @"\\b[a-f0-9]{{32,64}}\\b", "<hash>")
+| extend NormalizedFamilyTitle = replace_regex(NormalizedFamilyTitle, @"\\b[0-9a-f]{{8}}-[0-9a-f-]{{27,36}}\\b", "<guid>")
+| extend NormalizedFamilyTitle = replace_regex(NormalizedFamilyTitle, @"\\b[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{{2,}}\\b", "<user>")
+| where NormalizedFamilyTitle contains "{safe_title}"
+| project
+    IncidentNumber,
+    IncidentName,
+    Title,
+    Severity,
+    Status,
+    Classification,
+    ClassificationReason,
+    ClassificationComment,
+    Owner,
+    CreatedTime,
+    LastModifiedTime,
+    ModifiedBy,
+    Labels,
+    AdditionalData,
+    Tasks,
+    IncidentUrl
+| order by CreatedTime desc
+""".strip()
+
+        contains_res = la_query(contains_kql, f"P{days_i}D")
+        if not contains_res.get("ok"):
+            return contains_res
+
+        incidents = _la_first_table_dicts(contains_res["data"])
+        match_mode = "contains_normalized_family_title"
+
+    classification_summary: Dict[str, int] = {}
+    status_summary: Dict[str, int] = {}
+
+    for inc in incidents:
+        cls = str(inc.get("Classification") or "Unclassified")
+        st = str(inc.get("Status") or "Unknown")
+        classification_summary[cls] = classification_summary.get(cls, 0) + 1
+        status_summary[st] = status_summary.get(st, 0) + 1
+
+    return _ok({
+        "days_reviewed": days_i,
+        "match_mode": match_mode,
+        "normalized_title": normalized_title,
+        "count": len(incidents),
+        "classification_summary": classification_summary,
+        "status_summary": status_summary,
+        "incidents": incidents,
+    })
+
+def _risk_from_severity_and_alerts(severity: str, alert_count: int, entity_count: int) -> Tuple[str, int]:
+    sev = (severity or "").lower()
+    score = 0
+    if sev == "high":
+        score += 4
+    elif sev == "medium":
+        score += 2
+    else:
+        score += 1
+
+    if alert_count > 5:
+        score += 2
+    elif alert_count > 1:
+        score += 1
+
+    if entity_count > 3:
+        score += 1
+
+    if score >= 6:
+        return "High", score
+    if score >= 3:
+        return "Medium", score
+    return "Low", score
 
 # ============================================================
 # TOOLS
@@ -861,6 +1173,37 @@ def run_query(kql: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAUL
 
     bounded_kql = ensure_take_limit(kql, clamp_rows(max_rows))
     return la_query(bounded_kql, timespan)
+
+_register_tool_def(
+    "lookup_cmdb_entity",
+    "Performs a direct CMDB lookup in COVERAGE_CMDB for a host, IP, FQDN, domain, or infrastructure identifier.",
+    {
+        "value": "Entity value to search in CMDB",
+        "timespan": "ISO8601 duration like PT6H, P1D, P7D"
+    }
+)
+
+@mcp.tool
+def lookup_cmdb_entity(value: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
+    if not value:
+        return _fail("value is required", code="VALIDATION_ERROR")
+
+    try:
+        _ = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
+
+    res = _query_cmdb_entity(value, timespan)
+    if not res.get("ok"):
+        return res
+
+    rows = _la_first_table_dicts(res["data"])
+    return _ok({
+        "value": value,
+        "table": CMDB_TABLE,
+        "matches": rows,
+        "count": len(rows),
+    }, timespan=timespan)
 
 _register_tool_def(
     "list_analytics_rules",
@@ -1113,10 +1456,15 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
     findings = []
     total_events = 0
     risk_score = 0
+    tables_considered = [t for t, _ in queries]
     tables_checked = []
+    tables_succeeded = []
+    tables_failed = []
+    tables_skipped_by_catalog = []
 
     for table, where_clause in queries:
         if preferred_tables and table not in preferred_tables:
+            tables_skipped_by_catalog.append(table)
             continue
 
         tables_checked.append(table)
@@ -1129,8 +1477,13 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
 
         res = la_query(summary_kql, timespan)
         if not res.get("ok"):
+            tables_failed.append({
+                "table": table,
+                "error": res.get("error", {}),
+            })
             continue
 
+        tables_succeeded.append(table)
         rows = _la_first_table_dicts(res["data"])
         if not rows:
             continue
@@ -1145,26 +1498,38 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
 
         total_events += count
 
+        rationale = []
         if count > 100:
             risk_score += 2
+            rationale.append("high event volume")
         elif count > 20:
             risk_score += 1
+            rationale.append("moderate event volume")
 
         if table in ["SecurityEvent", "AuditLogs", "SecurityAlert"]:
             risk_score += 1
+            rationale.append("security-relevant table")
 
         findings.append({
             "table": table,
             "count": count,
             "first_seen": first_seen,
             "last_seen": last_seen,
+            "risk_rationale": rationale,
         })
 
     cmdb_context = None
+    cmdb_status = "not_reviewed"
     if entity_type in {"ip", "host", "domain"}:
         cmdb_res = _query_cmdb_entity(value, timespan)
         if cmdb_res.get("ok"):
-            cmdb_context = cmdb_res["data"]
+            cmdb_status = "reviewed"
+            cmdb_context = _la_first_table_dicts(cmdb_res["data"])
+        else:
+            cmdb_status = "lookup_failed"
+            cmdb_context = {
+                "error": cmdb_res.get("error", {})
+            }
 
     if risk_score >= 4:
         risk_level = "High"
@@ -1177,11 +1542,18 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
         "entity": value,
         "entity_type": entity_type,
         "timespan": timespan,
-        "telemetry_domains_checked": preferred_domains,
+        "telemetry_domains_considered": preferred_domains,
+        "tables_considered": tables_considered,
         "tables_checked": tables_checked,
+        "tables_succeeded": tables_succeeded,
+        "tables_failed": tables_failed,
+        "tables_skipped_by_catalog": tables_skipped_by_catalog,
         "tables_hit": len(findings),
         "total_events": total_events,
+        "risk_score": risk_score,
         "risk_level": risk_level,
+        "risk_note": "Heuristic score based on counts and table context; not a standalone verdict.",
+        "cmdb_status": cmdb_status,
         "cmdb_context": cmdb_context,
         "results": findings,
     })
@@ -1209,9 +1581,6 @@ def get_incident_report(
 
     top = clamp_rows(top)
 
-    # --------------------------------
-    # MODE 1 — LIST INCIDENTS
-    # --------------------------------
     if not incident_id:
         if hours.is_integer():
             ago_expr = f"{int(hours)}h"
@@ -1249,16 +1618,10 @@ SecurityIncident
             "incidents": incidents
         })
 
-    # --------------------------------
-    # MODE 2 — INCIDENT REPORT
-    # --------------------------------
     safe_id = escape_kql_string(str(incident_id))
 
     kql = f"""
-SecurityIncident
-| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
-| summarize arg_max(LastModifiedTime, *) by IncidentNumber
-| project IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime, AlertIds
+{_sentinel_incident_latest_kql(safe_id)}
 | mv-expand AlertIds
 | extend AlertIdStr = tostring(AlertIds)
 | join kind=leftouter (
@@ -1292,7 +1655,10 @@ SecurityIncident
     Status,
     Owner,
     CreatedTime,
-    LastModifiedTime
+    LastModifiedTime,
+    Classification,
+    ClassificationReason,
+    ClassificationComment
 """.strip()
 
     res = la_query(kql, timespan)
@@ -1322,6 +1688,9 @@ SecurityIncident
         "owner": incident.get("Owner"),
         "created_time": incident.get("CreatedTime"),
         "last_modified": incident.get("LastModifiedTime"),
+        "classification": incident.get("Classification"),
+        "classification_reason": incident.get("ClassificationReason"),
+        "classification_comment": incident.get("ClassificationComment"),
         "alerts_count": incident.get("Alerts"),
         "alert_names": incident.get("AlertNames"),
         "alert_components": incident.get("AlertComponents"),
@@ -1336,7 +1705,7 @@ SecurityIncident
 
 _register_tool_def(
     "investigate_incident",
-    "SOC investigation of a Microsoft Sentinel incident. Extracts alerts, entities, MITRE techniques, and timeline indicators.",
+    "SOC investigation of a Microsoft Sentinel incident. Extracts alerts, evidence-backed entities, timeline, CMDB context, and coverage notes.",
     {
         "incident_id": "Sentinel incident number",
         "timespan": "ISO8601 duration (P1D, P7D)"
@@ -1361,13 +1730,7 @@ def investigate_incident(incident_id: str, timespan: str = "P7D") -> dict:
         )
 
     safe_id = escape_kql_string(str(incident_id))
-
-    incident_kql = f"""
-SecurityIncident
-| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
-| where Severity !~ "Informational"
-| project IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime, AlertIds
-""".strip()
+    incident_kql = _sentinel_incident_latest_kql(safe_id)
 
     inc_res = la_query(incident_kql, timespan)
     if not inc_res.get("ok"):
@@ -1378,23 +1741,53 @@ SecurityIncident
         return _fail("Incident not found", code="NOT_FOUND")
 
     incident = incident_rows[0]
-    alert_ids = incident.get("AlertIds") or []
+    alert_ids = _parse_alert_ids(incident.get("AlertIds"))
 
-    if isinstance(alert_ids, str):
-        try:
-            alert_ids = json.loads(alert_ids)
-        except Exception:
-            alert_ids = []
+    workspace_domains = list(WORKSPACE_TABLE_CATALOG.keys()) if WORKSPACE_TABLE_CATALOG else []
+    coverage_notes = {
+        "catalog_loaded": bool(WORKSPACE_TABLE_CATALOG),
+        "telemetry_domains_available": workspace_domains,
+        "telemetry_reviewed": [],
+        "telemetry_not_reviewed": [],
+        "lookup_failures": [],
+    }
 
     if not alert_ids:
+        risk_level, risk_score = _risk_from_severity_and_alerts(
+            incident.get("Severity", ""),
+            alert_count=0,
+            entity_count=0,
+        )
         return _ok({
-            "incident": incident,
-            "alerts": [],
+            "incident": {
+                "id": incident.get("IncidentNumber"),
+                "name": incident.get("IncidentName"),
+                "title": incident.get("Title"),
+                "severity": incident.get("Severity"),
+                "status": incident.get("Status"),
+                "owner": incident.get("Owner"),
+                "classification": incident.get("Classification"),
+                "classification_reason": incident.get("ClassificationReason"),
+                "classification_comment": incident.get("ClassificationComment"),
+                "created_time": incident.get("CreatedTime"),
+                "last_modified_time": incident.get("LastModifiedTime"),
+            },
+            "alerts": {
+                "count": 0,
+                "details": [],
+            },
             "entities": {},
-            "timeline": {},
-            "mitre": {},
-            "risk_level": "Low",
-            "assessment": "Incident has no linked alerts"
+            "top_pivots": [],
+            "timeline": {
+                "incident_created": incident.get("CreatedTime"),
+                "first_alert": None,
+                "last_alert": None,
+            },
+            "asset_context": [],
+            "coverage": coverage_notes,
+            "risk_level": risk_level,
+            "risk_score": risk_score,
+            "assessment": "Incident has no linked alerts",
         })
 
     safe_alerts = [escape_kql_string(str(a)) for a in alert_ids if a]
@@ -1404,14 +1797,19 @@ SecurityIncident
 SecurityAlert
 | where SystemAlertId in ({alert_list})
 | project
+    SystemAlertId,
     AlertName = ProductName,
     Component = ProductComponentName,
     AlertTime = StartTime,
+    EndTime,
     Status,
+    Severity,
     CompromisedEntity,
     Tactics,
     Techniques,
+    AlertLink,
     Entities
+| order by AlertTime asc
 """.strip()
 
     alert_res = la_query(alerts_kql, timespan)
@@ -1419,46 +1817,37 @@ SecurityAlert
         return alert_res
 
     alerts = _la_first_table_dicts(alert_res["data"])
+    coverage_notes["telemetry_reviewed"].append("alerts_and_incidents")
 
-    users = set()
-    ips = set()
-    hosts = set()
-    domains = set()
+    entity_map = _extract_alert_entities(alerts)
+    entity_count = (
+        len(entity_map.get("users", []))
+        + len(entity_map.get("ips", []))
+        + len(entity_map.get("hosts", []))
+        + len(entity_map.get("domains", []))
+        + len(entity_map.get("hashes", []))
+        + len(entity_map.get("urls", []))
+    )
 
-    for alert in alerts:
-        entities = alert.get("Entities")
-        if not entities:
-            continue
+    top_pivots = _select_top_entities(entity_map, max_entities=3)
 
-        try:
-            ent_list = json.loads(entities) if isinstance(entities, str) else entities
-        except Exception:
-            continue
-
-        if not isinstance(ent_list, list):
-            continue
-
-        for e in ent_list:
-            if not isinstance(e, dict):
-                continue
-
-            etype = (e.get("Type") or "").lower()
-
-            if etype == "account":
-                if e.get("Name"):
-                    users.add(e.get("Name"))
-
-            elif etype == "ip":
-                if e.get("Address"):
-                    ips.add(e.get("Address"))
-
-            elif etype in ["host", "machine"]:
-                if e.get("HostName"):
-                    hosts.add(e.get("HostName"))
-
-            elif etype == "dns":
-                if e.get("DomainName"):
-                    domains.add(e.get("DomainName"))
+    cmdb_context = []
+    for pivot in top_pivots:
+        if pivot["type"] in {"ip", "host", "domain"}:
+            cmdb_res = _query_cmdb_entity(str(pivot["value"]), timespan)
+            if cmdb_res.get("ok"):
+                coverage_notes["telemetry_reviewed"].append("cmdb_and_asset_context")
+                cmdb_context.append({
+                    "entity": pivot["value"],
+                    "entity_type": pivot["type"],
+                    "matches": _la_first_table_dicts(cmdb_res["data"]),
+                })
+            else:
+                coverage_notes["lookup_failures"].append({
+                    "lookup": "cmdb",
+                    "entity": pivot["value"],
+                    "error": cmdb_res.get("error", {})
+                })
 
     alert_times = [a.get("AlertTime") for a in alerts if a.get("AlertTime")]
     first_alert = min(alert_times) if alert_times else None
@@ -1467,49 +1856,29 @@ SecurityAlert
     tactics = sorted({a.get("Tactics") for a in alerts if a.get("Tactics")})
     techniques = sorted({a.get("Techniques") for a in alerts if a.get("Techniques")})
 
-    cmdb_context = []
+    risk_level, risk_score = _risk_from_severity_and_alerts(
+        incident.get("Severity", ""),
+        alert_count=len(alerts),
+        entity_count=entity_count,
+    )
 
-    for pivot in list(ips)[:3] + list(hosts)[:3] + list(domains)[:3]:
-        cmdb_res = _query_cmdb_entity(str(pivot), timespan)
-        if cmdb_res.get("ok"):
-            cmdb_context.append({
-                "entity": pivot,
-                "result": cmdb_res["data"]
-            })
-
-    risk_score = 0
-    sev = (incident.get("Severity") or "").lower()
-
-    if sev == "high":
-        risk_score += 4
-    elif sev == "medium":
-        risk_score += 2
-    else:
-        risk_score += 1
-
-    if len(alerts) > 5:
-        risk_score += 2
-    if ips:
-        risk_score += 1
-    if users:
-        risk_score += 1
-    if hosts:
-        risk_score += 1
-
-    if risk_score >= 6:
-        risk_level = "High"
-    elif risk_score >= 3:
-        risk_level = "Medium"
-    else:
-        risk_level = "Low"
+    coverage_notes["telemetry_reviewed"] = sorted(set(coverage_notes["telemetry_reviewed"]))
+    if WORKSPACE_TABLE_CATALOG:
+        coverage_notes["telemetry_not_reviewed"] = sorted(
+            set(WORKSPACE_TABLE_CATALOG.keys()) - set(coverage_notes["telemetry_reviewed"])
+        )
 
     return _ok({
         "incident": {
             "id": incident.get("IncidentNumber"),
+            "name": incident.get("IncidentName"),
             "title": incident.get("Title"),
             "severity": incident.get("Severity"),
             "status": incident.get("Status"),
             "owner": incident.get("Owner"),
+            "classification": incident.get("Classification"),
+            "classification_reason": incident.get("ClassificationReason"),
+            "classification_comment": incident.get("ClassificationComment"),
             "created_time": incident.get("CreatedTime"),
             "last_modified_time": incident.get("LastModifiedTime"),
         },
@@ -1517,14 +1886,13 @@ SecurityAlert
             "count": len(alerts),
             "names": sorted({a.get("AlertName") for a in alerts if a.get("AlertName")}),
             "components": sorted({a.get("Component") for a in alerts if a.get("Component")}),
+            "details": alerts,
         },
-        "entities": {
-            "users": sorted(users),
-            "ips": sorted(ips),
-            "hosts": sorted(hosts),
-            "domains": sorted(domains),
-        },
+        "entities": entity_map,
+        "top_pivots": top_pivots,
         "timeline": {
+            "incident_created": incident.get("CreatedTime"),
+            "incident_last_modified": incident.get("LastModifiedTime"),
             "first_alert": first_alert,
             "last_alert": last_alert,
         },
@@ -1533,25 +1901,22 @@ SecurityAlert
             "techniques": techniques,
         },
         "asset_context": cmdb_context,
-        "risk_level": risk_level
+        "coverage": coverage_notes,
+        "risk_level": risk_level,
+        "risk_score": risk_score,
     })
 
 _register_tool_def(
     "get_similar_incident_history",
-    "Looks up incidents from the last N days with the same title as the target incident and returns prior classifications, comments, and status history for triage context.",
+    "Looks up incidents from the last N days with the same or similar normalized title and returns prior classifications and status history.",
     {
         "incident_id": "Sentinel incident number",
         "days": "optional integer, default 30"
     }
 )
+
 @mcp.tool
 def get_similar_incident_history(incident_id: str, days: int = 30) -> dict:
-    """
-    Retrieve prior incidents with the same or similar title over the last N days.
-    Exact normalized title match is attempted first; if no rows are found,
-    a normalized contains match is used as fallback.
-    """
-
     if not incident_id:
         return _fail("incident_id is required", code="VALIDATION_ERROR")
 
@@ -1563,13 +1928,8 @@ def get_similar_incident_history(incident_id: str, days: int = 30) -> dict:
     days_i = max(1, min(days_i, 90))
     safe_id = escape_kql_string(str(incident_id).strip())
 
-    # --------------------------------------------------
-    # STEP 1 - Get the reference incident and its title
-    # --------------------------------------------------
     current_kql = f"""
-SecurityIncident
-| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
-| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+{_sentinel_incident_latest_kql(safe_id)}
 | project IncidentNumber, IncidentName, Title, Severity, Status, CreatedTime, LastModifiedTime
 """.strip()
 
@@ -1587,99 +1947,9 @@ SecurityIncident
     if not title or not str(title).strip():
         return _fail("Incident title not found", code="PARSE_ERROR")
 
-    normalized_title = str(title).strip().lower()
-    safe_title = escape_kql_string(normalized_title)
-
-    # --------------------------------------------------
-    # STEP 2 - Exact normalized title match first
-    # --------------------------------------------------
-    exact_kql = f"""
-SecurityIncident
-| where CreatedTime >= ago({days_i}d)
-| where Severity !~ "Informational"
-| summarize arg_max(LastModifiedTime, *) by IncidentNumber
-| extend NormalizedTitle = tolower(trim(@" ", tostring(Title)))
-| where NormalizedTitle == "{safe_title}"
-| project
-    IncidentNumber,
-    IncidentName,
-    Title,
-    Severity,
-    Status,
-    Classification,
-    ClassificationReason,
-    ClassificationComment,
-    Owner,
-    CreatedTime,
-    LastModifiedTime,
-    ModifiedBy,
-    Labels,
-    AdditionalData,
-    Tasks,
-    IncidentUrl
-| order by CreatedTime desc
-""".strip()
-
-    exact_res = la_query(exact_kql, f"P{days_i}D")
-    if not exact_res.get("ok"):
-        return exact_res
-
-    exact_incidents = _la_first_table_dicts(exact_res["data"])
-
-    match_mode = "exact_normalized_title"
-
-    # --------------------------------------------------
-    # STEP 3 - Fallback to contains match if needed
-    # --------------------------------------------------
-    if exact_incidents:
-        incidents = exact_incidents
-    else:
-        contains_kql = f"""
-SecurityIncident
-| where CreatedTime >= ago({days_i}d)
-| where Severity !~ "Informational"
-| summarize arg_max(LastModifiedTime, *) by IncidentNumber
-| extend NormalizedTitle = tolower(trim(@" ", tostring(Title)))
-| where NormalizedTitle contains "{safe_title}"
-| project
-    IncidentNumber,
-    IncidentName,
-    Title,
-    Severity,
-    Status,
-    Classification,
-    ClassificationReason,
-    ClassificationComment,
-    Owner,
-    CreatedTime,
-    LastModifiedTime,
-    ModifiedBy,
-    Labels,
-    AdditionalData,
-    Tasks,
-    IncidentUrl
-| order by CreatedTime desc
-""".strip()
-
-        contains_res = la_query(contains_kql, f"P{days_i}D")
-        if not contains_res.get("ok"):
-            return contains_res
-
-        incidents = _la_first_table_dicts(contains_res["data"])
-        match_mode = "contains_normalized_title"
-
-    # --------------------------------------------------
-    # STEP 4 - Build simple recurrence summary
-    # --------------------------------------------------
-    classification_summary: Dict[str, int] = {}
-    status_summary: Dict[str, int] = {}
-
-    for inc in incidents:
-        cls = str(inc.get("Classification") or "Unclassified")
-        st = str(inc.get("Status") or "Unknown")
-
-        classification_summary[cls] = classification_summary.get(cls, 0) + 1
-        status_summary[st] = status_summary.get(st, 0) + 1
+    hist_res = _similar_incident_lookup(str(title), days_i)
+    if not hist_res.get("ok"):
+        return hist_res
 
     return _ok({
         "reference_incident": {
@@ -1691,13 +1961,166 @@ SecurityIncident
             "created_time": current_incident.get("CreatedTime"),
             "last_modified_time": current_incident.get("LastModifiedTime"),
         },
-        "days_reviewed": days_i,
-        "match_mode": match_mode,
-        "count": len(incidents),
-        "classification_summary": classification_summary,
-        "status_summary": status_summary,
-        "incidents": incidents,
+        **hist_res["data"],
     })
+
+_register_tool_def(
+    "triage_incident",
+    "Performs end-to-end incident triage: incident context, alert review, similar history, CMDB enrichment, and top entity pivots.",
+    {
+        "incident_id": "Sentinel incident number",
+        "timespan": "ISO8601 duration (P1D, P7D)",
+        "similar_days": "optional integer, default 30",
+        "max_pivots": "optional integer, default 3"
+    }
+)
+
+@mcp.tool
+def triage_incident(
+    incident_id: str,
+    timespan: str = "P7D",
+    similar_days: int = DEFAULT_SIMILAR_DAYS,
+    max_pivots: int = 3,
+) -> dict:
+    if not incident_id:
+        return _fail("incident_id is required", code="VALIDATION_ERROR")
+
+    try:
+        hours = parse_timespan_to_hours(timespan)
+        similar_days_i = max(1, min(int(similar_days), 90))
+        max_pivots_i = max(1, min(int(max_pivots), 5))
+    except Exception as e:
+        return _fail("Invalid input", code="VALIDATION_ERROR", detail=str(e))
+
+    if hours <= 0 or hours > MAX_HOURS_INCIDENT:
+        return _fail(
+            f"Timespan exceeds allowed window ({MAX_HOURS_INCIDENT}h max)",
+            code="VALIDATION_ERROR",
+            detail=f"got {hours}h"
+        )
+
+    inv_res = investigate_incident(incident_id=incident_id, timespan=timespan)
+    if not inv_res.get("ok"):
+        return inv_res
+
+    inv = inv_res["data"]
+
+    title = inv.get("incident", {}).get("title") or ""
+    hist_res = _similar_incident_lookup(title, similar_days_i) if title else _ok({
+        "days_reviewed": similar_days_i,
+        "match_mode": "not_run",
+        "normalized_title": "",
+        "count": 0,
+        "classification_summary": {},
+        "status_summary": {},
+        "incidents": [],
+    })
+
+    selected_pivots = inv.get("top_pivots", [])[:max_pivots_i]
+    pivot_results = []
+    lookup_failures = []
+
+    for pivot in selected_pivots:
+        if pivot["type"] not in {"ip", "user", "host", "domain", "sha256", "sha1", "md5"}:
+            continue
+
+        res = analyze_entity(
+            value=str(pivot["value"]),
+            timespan=timespan,
+            max_rows=DEFAULT_ROWS
+        )
+
+        if res.get("ok"):
+            pivot_results.append({
+                "entity": pivot,
+                "result": res["data"],
+            })
+        else:
+            lookup_failures.append({
+                "entity": pivot,
+                "error": res.get("error", {}),
+            })
+
+    supporting_findings = []
+    weakening_findings = []
+    unresolved_gaps = []
+
+    if hist_res.get("ok"):
+        hist = hist_res["data"]
+        if hist.get("count", 0) > 0:
+            supporting_findings.append(
+                f"Historical incidents found with similar title: {hist.get('count')}"
+            )
+            if hist.get("classification_summary"):
+                weakening_findings.append(
+                    f"Historical classifications: {hist.get('classification_summary')}"
+                )
+    else:
+        unresolved_gaps.append("Historical incident lookup failed")
+
+    for pr in pivot_results:
+        entity_value = pr["entity"]["value"]
+        entity_type = pr["entity"]["type"]
+        pdata = pr["result"]
+
+        if pdata.get("tables_hit", 0) > 0:
+            supporting_findings.append(
+                f"{entity_type}:{entity_value} had activity in reviewed telemetry ({pdata.get('tables_hit')} tables hit)"
+            )
+        else:
+            weakening_findings.append(
+                f"{entity_type}:{entity_value} had no hits in reviewed telemetry"
+            )
+
+        if pdata.get("tables_failed"):
+            unresolved_gaps.append(
+                f"{entity_type}:{entity_value} had failed lookups in some tables"
+            )
+
+    if lookup_failures:
+        unresolved_gaps.append("One or more entity pivots failed")
+
+    incident_severity = (inv.get("incident", {}).get("severity") or "").lower()
+    alert_count = inv.get("alerts", {}).get("count", 0)
+
+    verdict = "Suspicious"
+    if incident_severity == "high" and (supporting_findings or alert_count > 1):
+        verdict = "Clearly concerning"
+    elif not supporting_findings and weakening_findings:
+        verdict = "Likely benign"
+
+    return _ok({
+        "triage_verdict": verdict,
+        "incident": inv.get("incident"),
+        "why_incident_triggered": {
+            "alert_count": inv.get("alerts", {}).get("count", 0),
+            "alert_names": inv.get("alerts", {}).get("names", []),
+            "alert_components": inv.get("alerts", {}).get("components", []),
+            "mitre": inv.get("mitre", {}),
+        },
+        "entities_investigated": selected_pivots,
+        "cmdb_asset_context": inv.get("asset_context", []),
+        "historical_incident_context": hist_res["data"] if hist_res.get("ok") else {
+            "error": hist_res.get("error", {})
+        },
+        "telemetry_reviewed": {
+            "coverage": inv.get("coverage", {}),
+            "entity_pivots": pivot_results,
+        },
+        "findings_supporting_suspicion": supporting_findings,
+        "findings_weakening_suspicion": weakening_findings,
+        "missing_evidence_or_unresolved_gaps": unresolved_gaps,
+        "timeline": inv.get("timeline", {}),
+        "risk_assessment": {
+            "risk_level": inv.get("risk_level"),
+            "risk_score": inv.get("risk_score"),
+        },
+        "analyst_conclusion": (
+            "Verdict is based on reviewed incident context, linked alerts, selected entity pivots, "
+            "CMDB enrichment where applicable, and recent similar incident history."
+        ),
+    })
+
 # ============================================================
 # EXPORT ASGI APP
 # ============================================================
