@@ -34,20 +34,40 @@ jobs:
             --target=.python_packages/lib/site-packages \
             -r requirements.txt
 
+      - name: Show repo tree
+        run: |
+          pwd
+          ls -la
+          echo "---- mcp_server ----"
+          ls -la mcp_server || true
+          echo "---- mcp_server/services ----"
+          ls -la mcp_server/services || true
+          echo "---- mcp_server/tools ----"
+          ls -la mcp_server/tools || true
+          echo "---- mcp_server/clients ----"
+          ls -la mcp_server/clients || true
+
       - name: Verify project layout
         run: |
           test -d mcp_server
           test -f mcp_server/__init__.py
           test -f mcp_server/app.py
           test -d mcp_server/services
-          test -f mcp_server/services/__init__.py
           test -f mcp_server/services/analytics_rules.py
+          test -f mcp_server/services/cmdb.py
+          test -f mcp_server/services/entities.py
+          test -f mcp_server/services/incidents.py
+          test -f mcp_server/services/schema.py
+          test -f mcp_server/services/use_case_docs.py
           test -d mcp_server/tools
-          test -f mcp_server/tools/__init__.py
+          test -f mcp_server/tools/analytics.py
+          test -f mcp_server/tools/catalog.py
+          test -f mcp_server/tools/investigation.py
+          test -f mcp_server/tools/query.py
           test -d mcp_server/clients
-          test -f mcp_server/clients/__init__.py
+          test -f mcp_server/clients/arm.py
+          test -f mcp_server/clients/log_analytics.py
           test -f function_app.py
-          test -f mcp_server.py
           test -f host.json
           test -f requirements.txt
           test -f workspace_tables.json
@@ -56,7 +76,6 @@ jobs:
         run: |
           zip -r release.zip \
             function_app.py \
-            mcp_server.py \
             host.json \
             requirements.txt \
             workspace_tables.json \
@@ -65,7 +84,7 @@ jobs:
 
       - name: Show zip contents
         run: |
-          unzip -l release.zip | sed -n '1,200p'
+          unzip -l release.zip | sed -n '1,250p'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -88,7 +107,7 @@ jobs:
         run: |
           ls -la
           test -f release.zip
-          unzip -l release.zip | sed -n '1,200p'
+          unzip -l release.zip | sed -n '1,250p'
 
       - name: Deploy to Azure Functions
         uses: Azure/functions-action@v1
