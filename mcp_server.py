@@ -1203,18 +1203,35 @@ def get_incident_report(
     top: int = 50
 ) -> dict:
     try:
-        _ = parse_timespan_to_hours(timespan)
+        hours = parse_timespan_to_hours(timespan)
     except Exception as e:
         return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
 
     top = clamp_rows(top)
 
+    # --------------------------------
+    # MODE 1 — LIST INCIDENTS
+    # --------------------------------
     if not incident_id:
+        if hours.is_integer():
+            ago_expr = f"{int(hours)}h"
+        else:
+            ago_expr = f"{hours}h"
+
         kql = f"""
 SecurityIncident
 | where Severity !~ "Informational"
-| sort by CreatedTime desc
-| project IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime
+| where CreatedTime >= ago({ago_expr})
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| project
+    IncidentNumber,
+    Title,
+    Severity,
+    Status,
+    Owner,
+    CreatedTime,
+    LastModifiedTime
+| order by CreatedTime desc
 | take {top}
 """.strip()
 
@@ -1232,11 +1249,15 @@ SecurityIncident
             "incidents": incidents
         })
 
+    # --------------------------------
+    # MODE 2 — INCIDENT REPORT
+    # --------------------------------
     safe_id = escape_kql_string(str(incident_id))
 
     kql = f"""
 SecurityIncident
 | where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
 | project IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime, AlertIds
 | mv-expand AlertIds
 | extend AlertIdStr = tostring(AlertIds)
@@ -1264,7 +1285,14 @@ SecurityIncident
     TechniquesSet = make_set(Techniques, 10),
     FirstAlert = min(AlertTime),
     LastAlert = max(AlertTime)
-    by IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime
+    by
+    IncidentNumber,
+    Title,
+    Severity,
+    Status,
+    Owner,
+    CreatedTime,
+    LastModifiedTime
 """.strip()
 
     res = la_query(kql, timespan)
