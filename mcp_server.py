@@ -1618,10 +1618,30 @@ SecurityIncident
             "incidents": incidents
         })
 
-    safe_id = escape_kql_string(str(incident_id))
+        safe_id = escape_kql_string(str(incident_id))
 
-    kql = f"""
-{_sentinel_incident_latest_kql(safe_id)}
+        kql = f"""
+SecurityIncident
+| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
+| where Severity !~ "Informational"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| extend
+    OwnerStr = tostring(Owner),
+    ClassificationStr = tostring(Classification),
+    ClassificationReasonStr = tostring(ClassificationReason),
+    ClassificationCommentStr = tostring(ClassificationComment)
+| project
+    IncidentNumber,
+    Title,
+    Severity,
+    Status,
+    Owner = OwnerStr,
+    CreatedTime,
+    LastModifiedTime,
+    Classification = ClassificationStr,
+    ClassificationReason = ClassificationReasonStr,
+    ClassificationComment = ClassificationCommentStr,
+    AlertIds
 | mv-expand AlertIds
 | extend AlertIdStr = tostring(AlertIds)
 | join kind=leftouter (
@@ -1630,12 +1650,12 @@ SecurityIncident
         SystemAlertId,
         AlertName = ProductName,
         AlertComponent = ProductComponentName,
-        AlertStatus = Status,
+        AlertStatus = tostring(Status),
         AlertTime = StartTime,
-        CompromisedEntity,
-        Tactics,
-        Techniques,
-        Entities
+        CompromisedEntity = tostring(CompromisedEntity),
+        Tactics = tostring(Tactics),
+        Techniques = tostring(Techniques),
+        Entities = tostring(Entities)
     | extend AlertIdStr = tostring(SystemAlertId)
 ) on AlertIdStr
 | summarize
@@ -1730,7 +1750,31 @@ def investigate_incident(incident_id: str, timespan: str = "P7D") -> dict:
         )
 
     safe_id = escape_kql_string(str(incident_id))
-    incident_kql = _sentinel_incident_latest_kql(safe_id)
+
+    incident_kql = f"""
+SecurityIncident
+| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
+| where Severity !~ "Informational"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| extend
+    OwnerStr = tostring(Owner),
+    ClassificationStr = tostring(Classification),
+    ClassificationReasonStr = tostring(ClassificationReason),
+    ClassificationCommentStr = tostring(ClassificationComment)
+| project
+    IncidentNumber,
+    IncidentName,
+    Title,
+    Severity,
+    Status,
+    Owner = OwnerStr,
+    CreatedTime,
+    LastModifiedTime,
+    Classification = ClassificationStr,
+    ClassificationReason = ClassificationReasonStr,
+    ClassificationComment = ClassificationCommentStr,
+    AlertIds
+""".strip()
 
     inc_res = la_query(incident_kql, timespan)
     if not inc_res.get("ok"):
@@ -1787,7 +1831,7 @@ def investigate_incident(incident_id: str, timespan: str = "P7D") -> dict:
             "coverage": coverage_notes,
             "risk_level": risk_level,
             "risk_score": risk_score,
-            "assessment": "Incident has no linked alerts",
+            "assessment": "Incident has no linked alerts"
         })
 
     safe_alerts = [escape_kql_string(str(a)) for a in alert_ids if a]
@@ -1905,7 +1949,6 @@ SecurityAlert
         "risk_level": risk_level,
         "risk_score": risk_score,
     })
-
 _register_tool_def(
     "get_similar_incident_history",
     "Looks up incidents from the last N days with the same or similar normalized title and returns prior classifications and status history.",
