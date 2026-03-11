@@ -5,11 +5,19 @@ import re
 import json
 import urllib.request
 import time
+import logging
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 # ============================================================
 # MCP SETUP
 # ============================================================
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger("SentinelMCP")
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "SentinelMCP/1.0"})
 
 mcp = FastMCP("SentinelMCP")
 
@@ -109,13 +117,15 @@ def _register_tool_def(name: str, description: str, params: dict) -> None:
 # ============================================================
 
 _TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}
+_TOKEN_CACHE_LOCK = threading.Lock()
 
 def get_managed_identity_token(resource: str) -> str:
     now = int(time.time())
 
-    cached = _TOKEN_CACHE.get(resource)
-    if cached and cached.get("exp", 0) - now > 60:
-        return cached["token"]
+    with _TOKEN_CACHE_LOCK:
+        cached = _TOKEN_CACHE.get(resource)
+        if cached and cached.get("exp", 0) - now > 60:
+            return cached["token"]
 
     identity_endpoint = os.environ.get("IDENTITY_ENDPOINT") or os.environ.get("MSI_ENDPOINT")
     identity_header = os.environ.get("IDENTITY_HEADER") or os.environ.get("MSI_SECRET")
@@ -141,10 +151,11 @@ def get_managed_identity_token(resource: str) -> str:
             token = payload["access_token"]
             expires_in = int(payload.get("expires_in") or 300)
 
-            _TOKEN_CACHE[resource] = {
-                "token": token,
-                "exp": now + expires_in,
-            }
+            with _TOKEN_CACHE_LOCK:
+                _TOKEN_CACHE[resource] = {
+                    "token": token,
+                    "exp": now + expires_in,
+                }
             return token
 
     # Fallback IMDS
@@ -161,10 +172,11 @@ def get_managed_identity_token(resource: str) -> str:
         token = payload["access_token"]
         expires_in = int(payload.get("expires_in") or 300)
 
-        _TOKEN_CACHE[resource] = {
-            "token": token,
-            "exp": now + expires_in,
-        }
+        with _TOKEN_CACHE_LOCK:
+            _TOKEN_CACHE[resource] = {
+                "token": token,
+                "exp": now + expires_in,
+            }
         return token
 
 # ============================================================
@@ -220,10 +232,19 @@ def validate_table_name(table: str) -> str:
     return table
 
 def kql_safety_check(kql: str):
-    lowered = (kql or "").lower()
+    lowered = (kql or "").lower().strip()
+
+    if not lowered:
+        raise ValueError("KQL cannot be empty")
+
+    if ";" in lowered:
+        raise ValueError("Multiple KQL statements are not allowed")
 
     if re.fullmatch(r"\s*search\s+\*\s*", lowered):
         raise ValueError("KQL too broad: 'search *' not allowed")
+
+    if re.search(r"\bunion\s+\*\b", lowered):
+        raise ValueError("KQL too broad: 'union *' not allowed")
 
     blocked = [
         "externaldata",
@@ -234,11 +255,20 @@ def kql_safety_check(kql: str):
         ".alter",
         ".create",
         ".ingest",
+        ".clear",
+        ".set",
+        ".append",
     ]
 
     for op in blocked:
         if op in lowered:
             raise ValueError(f"KQL contains blocked operator: {op}")
+
+def _run_query_requires_reasonable_scope(kql: str) -> None:
+    lowered = (kql or "").lower()
+
+    if " where " not in f" {lowered} ":
+        raise ValueError("Query must include at least one where clause")
 
 def ensure_take_limit(kql: str, limit: int) -> str:
     lowered = (kql or "").lower()
@@ -413,6 +443,7 @@ def _query_cmdb_entity(value: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
 """.strip()
 
     return la_query(fallback_kql, timespan)
+
 # ============================================================
 # LOG ANALYTICS / ARM CLIENTS
 # ============================================================
@@ -432,8 +463,10 @@ def la_query(kql: str, timespan: str) -> dict:
 
     url = f"https://api.loganalytics.io/v1/workspaces/{WORKSPACE_ID}/query"
 
+    start = time.time()
+
     try:
-        response = requests.post(
+        response = SESSION.post(
             url,
             headers={
                 "Authorization": f"Bearer {token}",
@@ -453,7 +486,10 @@ def la_query(kql: str, timespan: str) -> dict:
             timespan=timespan,
         )
 
+    elapsed_ms = int((time.time() - start) * 1000)
+
     if not response.ok:
+        logger.warning("Log Analytics query failed status=%s duration_ms=%s", response.status_code, elapsed_ms)
         return _fail(
             "Log Analytics query failed",
             code="LOG_ANALYTICS_ERROR",
@@ -463,7 +499,9 @@ def la_query(kql: str, timespan: str) -> dict:
         )
 
     try:
-        return _ok(response.json(), timespan=timespan)
+        payload = response.json()
+        logger.info("Log Analytics query ok duration_ms=%s timespan=%s", elapsed_ms, timespan)
+        return _ok(payload, timespan=timespan, duration_ms=elapsed_ms)
     except Exception as e:
         return _fail(
             "Failed to parse Log Analytics JSON response",
@@ -478,8 +516,10 @@ def _arm_get(url: str) -> dict:
     except Exception as e:
         return _fail("Failed to acquire ARM token", code="MANAGED_IDENTITY_ERROR", detail=str(e))
 
+    start = time.time()
+
     try:
-        resp = requests.get(
+        resp = SESSION.get(
             url,
             headers={"Authorization": f"Bearer {token}"},
             timeout=HTTP_TIMEOUT_SECONDS,
@@ -487,7 +527,10 @@ def _arm_get(url: str) -> dict:
     except Exception as e:
         return _fail("HTTP request to ARM failed", code="HTTP_ERROR", detail=str(e))
 
+    elapsed_ms = int((time.time() - start) * 1000)
+
     if not resp.ok:
+        logger.warning("ARM request failed status=%s duration_ms=%s", resp.status_code, elapsed_ms)
         return _fail(
             "ARM request failed",
             code="ARM_ERROR",
@@ -496,7 +539,9 @@ def _arm_get(url: str) -> dict:
         )
 
     try:
-        return _ok(resp.json())
+        payload = resp.json()
+        logger.info("ARM request ok duration_ms=%s", elapsed_ms)
+        return _ok(payload, duration_ms=elapsed_ms)
     except Exception as e:
         return _fail("Failed to parse ARM JSON response", code="PARSE_ERROR", detail=str(e))
 
@@ -848,6 +893,7 @@ def run_query(kql: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAUL
 
     try:
         kql_safety_check(kql)
+        _run_query_requires_reasonable_scope(kql)
         hours = parse_timespan_to_hours(timespan)
     except Exception as e:
         return _fail("Invalid query input", code="VALIDATION_ERROR", detail=str(e))
@@ -1544,6 +1590,7 @@ _register_tool_def(
         "days": "optional integer, default 30"
     }
 )
+
 @mcp.tool
 def get_similar_incident_history(incident_id: str, days: int = 30) -> dict:
     """
@@ -1698,6 +1745,7 @@ SecurityIncident
         "status_summary": status_summary,
         "incidents": incidents,
     })
+
 # ============================================================
 # EXPORT ASGI APP
 # ============================================================
