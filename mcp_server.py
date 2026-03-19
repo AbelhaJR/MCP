@@ -1,5 +1,7 @@
 from fastmcp import FastMCP
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import os
 import re
 import json
@@ -7,6 +9,7 @@ import urllib.request
 import time
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 
 # ============================================================
@@ -16,8 +19,20 @@ from typing import Any, Dict, List, Optional, Tuple
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("SentinelMCP")
 
+# ── HTTP session with automatic retry on transient errors ──────────────────
+# Retries on 429 (throttle), 500, 502, 503, 504 with exponential backoff.
+# backoff_factor=1 → waits 1s, 2s, 4s between attempts.
+# Respects Retry-After headers automatically when status_forcelist includes 429.
+_RETRY_POLICY = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+    raise_on_status=False,
+)
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "SentinelMCP/1.0"})
+SESSION.mount("https://", HTTPAdapter(max_retries=_RETRY_POLICY))
 
 mcp = FastMCP("SentinelMCP")
 
@@ -40,9 +55,9 @@ try:
                 if isinstance(vals, list)
             }
         else:
-            print("Workspace catalog is not a JSON object")
+            logger.warning("Workspace catalog is not a JSON object")
 except Exception as e:
-    print("Failed to load workspace catalog:", e)
+    logger.error("Failed to load workspace catalog: %s", e)
     WORKSPACE_TABLE_CATALOG = {}
 
 # ============================================================
@@ -63,6 +78,10 @@ DEFAULT_ROWS = 50
 
 DEFAULT_TIMESPAN = os.environ.get("DEFAULT_TIMESPAN", "P3D")
 HTTP_TIMEOUT_SECONDS = int(os.environ.get("LA_HTTP_TIMEOUT", "15"))
+
+# Wall-clock cap (seconds) for parallel fan-out queries in analyze_entity /
+# investigate_incident.  Individual per-request timeout is HTTP_TIMEOUT_SECONDS.
+PARALLEL_WALL_CLOCK_TIMEOUT = int(os.environ.get("PARALLEL_WALL_CLOCK_TIMEOUT", "30"))
 
 MAX_HOURS_RUN_QUERY = 72
 MAX_HOURS_ANALYZE_ENTITY = 168
@@ -104,16 +123,10 @@ def _fail(
 _TOOL_DEFS: List[dict] = []
 
 def _register_tool_def(name: str, description: str, params: dict) -> None:
-    _TOOL_DEFS.append(
-        {
-            "name": name,
-            "description": description,
-            "params": params,
-        }
-    )
+    _TOOL_DEFS.append({"name": name, "description": description, "params": params})
 
 # ============================================================
-# MANAGED IDENTITY
+# MANAGED IDENTITY  (thread-safe token cache)
 # ============================================================
 
 _TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -139,44 +152,27 @@ def get_managed_identity_token(resource: str) -> str:
 
         req = urllib.request.Request(
             url,
-            headers={
-                "X-IDENTITY-HEADER": identity_header,
-                "Metadata": "true",
-            },
+            headers={"X-IDENTITY-HEADER": identity_header, "Metadata": "true"},
             method="GET",
         )
-
         with urllib.request.urlopen(req, timeout=10) as resp:
             payload = json.loads(resp.read().decode())
             token = payload["access_token"]
             expires_in = int(payload.get("expires_in") or 300)
-
             with _TOKEN_CACHE_LOCK:
-                _TOKEN_CACHE[resource] = {
-                    "token": token,
-                    "exp": now + expires_in,
-                }
+                _TOKEN_CACHE[resource] = {"token": token, "exp": now + expires_in}
             return token
 
-    # Fallback IMDS
+    # Fallback: IMDS (VM / container)
     extra = f"&client_id={client_id}" if client_id else ""
     url = f"{IMDS_ENDPOINT}?api-version=2018-02-01&resource={resource}{extra}"
-    req = urllib.request.Request(
-        url,
-        headers={"Metadata": "true"},
-        method="GET",
-    )
-
+    req = urllib.request.Request(url, headers={"Metadata": "true"}, method="GET")
     with urllib.request.urlopen(req, timeout=10) as resp:
         payload = json.loads(resp.read().decode())
         token = payload["access_token"]
         expires_in = int(payload.get("expires_in") or 300)
-
         with _TOKEN_CACHE_LOCK:
-            _TOKEN_CACHE[resource] = {
-                "token": token,
-                "exp": now + expires_in,
-            }
+            _TOKEN_CACHE[resource] = {"token": token, "exp": now + expires_in}
         return token
 
 # ============================================================
@@ -187,11 +183,7 @@ _TABLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 def parse_timespan_to_hours(timespan: str) -> float:
     """
-    Supports:
-      - PT#H
-      - PT#M
-      - PT#H#M
-      - P#D
+    Supports: PT#H, PT#M, PT#H#M, P#D
     """
     ts = (timespan or "").strip()
 
@@ -247,26 +239,16 @@ def kql_safety_check(kql: str):
         raise ValueError("KQL too broad: 'union *' not allowed")
 
     blocked = [
-        "externaldata",
-        "evaluate",
-        "make-series",
-        ".drop",
-        ".delete",
-        ".alter",
-        ".create",
-        ".ingest",
-        ".clear",
-        ".set",
-        ".append",
+        "externaldata", "evaluate", "make-series",
+        ".drop", ".delete", ".alter", ".create",
+        ".ingest", ".clear", ".set", ".append",
     ]
-
     for op in blocked:
         if op in lowered:
             raise ValueError(f"KQL contains blocked operator: {op}")
 
 def _run_query_requires_reasonable_scope(kql: str) -> None:
     lowered = (kql or "").lower()
-
     if " where " not in f" {lowered} ":
         raise ValueError("Query must include at least one where clause")
 
@@ -404,16 +386,9 @@ def _query_cmdb_entity(value: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
     or tostring(Scanning_Information) contains "{safe_value}"
     or tostring(logsource) contains "{safe_value}"
 | project
-    Key,
-    Management_IP,
-    ApplicationAndComponentInstance,
-    Network_Interfaces,
-    Updated,
-    Scanning_Information,
-    BusinessEntity,
-    FQDN,
-    PSNC,
-    logsource
+    Key, Management_IP, ApplicationAndComponentInstance,
+    Network_Interfaces, Updated, Scanning_Information,
+    BusinessEntity, FQDN, PSNC, logsource
 | take 20
 """.strip()
 
@@ -429,16 +404,9 @@ def _query_cmdb_entity(value: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
 {CMDB_TABLE}
 | where tostring(*) contains "{safe_value}"
 | project
-    Key,
-    Management_IP,
-    ApplicationAndComponentInstance,
-    Network_Interfaces,
-    Updated,
-    Scanning_Information,
-    BusinessEntity,
-    FQDN,
-    PSNC,
-    logsource
+    Key, Management_IP, ApplicationAndComponentInstance,
+    Network_Interfaces, Updated, Scanning_Information,
+    BusinessEntity, FQDN, PSNC, logsource
 | take 20
 """.strip()
 
@@ -462,20 +430,18 @@ def la_query(kql: str, timespan: str) -> dict:
         )
 
     url = f"https://api.loganalytics.io/v1/workspaces/{WORKSPACE_ID}/query"
-
     start = time.time()
 
     try:
+        # SESSION already has the Retry adapter mounted — transient errors are
+        # retried automatically with exponential backoff.
         response = SESSION.post(
             url,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
-            json={
-                "query": kql,
-                "timespan": timespan,
-            },
+            json={"query": kql, "timespan": timespan},
             timeout=HTTP_TIMEOUT_SECONDS,
         )
     except Exception as e:
@@ -489,7 +455,10 @@ def la_query(kql: str, timespan: str) -> dict:
     elapsed_ms = int((time.time() - start) * 1000)
 
     if not response.ok:
-        logger.warning("Log Analytics query failed status=%s duration_ms=%s", response.status_code, elapsed_ms)
+        logger.warning(
+            "Log Analytics query failed status=%s duration_ms=%s",
+            response.status_code, elapsed_ms,
+        )
         return _fail(
             "Log Analytics query failed",
             code="LOG_ANALYTICS_ERROR",
@@ -544,6 +513,74 @@ def _arm_get(url: str) -> dict:
         return _ok(payload, duration_ms=elapsed_ms)
     except Exception as e:
         return _fail("Failed to parse ARM JSON response", code="PARSE_ERROR", detail=str(e))
+
+def _arm_get_paged(base_url: str) -> dict:
+    """
+    Follow ARM nextLink pagination and return all items in a single list.
+    Handles workspaces with 200+ analytics rules etc.
+    """
+    all_items = []
+    url = base_url
+
+    while url:
+        res = _arm_get(url)
+        if not res.get("ok"):
+            return res
+        data = res["data"]
+        all_items.extend(data.get("value") or [])
+        url = data.get("nextLink")  # None when last page
+
+    return _ok({"value": all_items})
+
+# ============================================================
+# PARALLEL QUERY HELPER
+# ============================================================
+
+def _run_queries_parallel(
+    tasks: List[Tuple[str, str, str]],
+    timespan: str,
+    wall_clock_timeout: int = PARALLEL_WALL_CLOCK_TIMEOUT,
+) -> Dict[str, dict]:
+    """
+    Execute multiple LA queries in parallel with a shared wall-clock timeout.
+
+    tasks: list of (task_id, table_name, kql_string)
+    Returns: dict mapping task_id → la_query result dict
+    """
+    results: Dict[str, dict] = {}
+
+    def _run(task_id: str, kql: str) -> Tuple[str, dict]:
+        return task_id, la_query(kql, timespan)
+
+    with ThreadPoolExecutor(max_workers=min(len(tasks), 8)) as executor:
+        futures = {
+            executor.submit(_run, task_id, kql): task_id
+            for task_id, _table, kql in tasks
+        }
+        deadline = time.time() + wall_clock_timeout
+
+        for future in as_completed(futures, timeout=max(1, deadline - time.time())):
+            try:
+                task_id, result = future.result(timeout=1)
+                results[task_id] = result
+            except Exception as e:
+                task_id = futures[future]
+                results[task_id] = _fail(
+                    "Query task failed or timed out",
+                    code="TASK_ERROR",
+                    detail=str(e),
+                )
+
+    # Tasks that never completed before the wall clock get a timeout entry
+    for _task_id, table, _kql in tasks:
+        if _task_id not in results:
+            results[_task_id] = _fail(
+                f"Query timed out after {wall_clock_timeout}s",
+                code="TIMEOUT",
+                detail=f"table={table}",
+            )
+
+    return results
 
 # ============================================================
 # ANALYTICS RULE HELPERS
@@ -614,7 +651,7 @@ def _extract_ops_from_kql(kql: str) -> List[str]:
         "where", "summarize", "join", "extend",
         "project", "project-away", "parse",
         "mv-expand", "evaluate", "union",
-        "lookup", "distinct"
+        "lookup", "distinct",
     ]
     lowered = kql.lower()
     return [op for op in ops if re.search(rf"\b{re.escape(op)}\b", lowered)]
@@ -645,7 +682,7 @@ def _detect_entity_hints(kql: str) -> List[str]:
         "IPAddress", "IpAddress", "CallerIpAddress", "RemoteIP",
         "DeviceName", "Computer", "HostName",
         "FileName", "SHA256", "SHA1", "MD5",
-        "ProcessCommandLine", "CommandLine", "Url", "RemoteUrl"
+        "ProcessCommandLine", "CommandLine", "Url", "RemoteUrl",
     ]
     hits = []
     for f in fields:
@@ -683,12 +720,12 @@ def _find_rule_id_by_name(rule_name: str) -> Optional[str]:
     base = _sentinel_rules_base_url()
     url = f"{base}?api-version=2023-09-01-preview"
 
-    res = _arm_get(url)
+    # Use paginated fetch so we don't miss rules on large workspaces
+    res = _arm_get_paged(url)
     if not res.get("ok"):
         return None
 
     target = (rule_name or "").strip().lower()
-
     for it in (res["data"].get("value") or []):
         props = it.get("properties") or {}
         dn = (props.get("displayName") or "").strip().lower()
@@ -733,18 +770,26 @@ def _build_confluence_html(doc: dict) -> str:
 
 _register_tool_def(
     "get_tools",
-    "Returns the exact MCP tool list and parameter formats.",
-    {}
+    (
+        "Returns the full list of available MCP tools with their parameter formats. "
+        "Call this first if you are unsure which tool to use for a task."
+    ),
+    {},
 )
 
 @mcp.tool
 def get_tools() -> dict:
     return _ok({"tools": _TOOL_DEFS, "mcp_path": "/mcp"})
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "ping",
-    "Connectivity test for the MCP endpoint (does not query Sentinel).",
-    {}
+    (
+        "Connectivity and configuration health check. Does not query Sentinel. "
+        "Use this to verify the MCP endpoint is reachable and the workspace is configured "
+        "before running any other tools."
+    ),
+    {},
 )
 
 @mcp.tool
@@ -756,10 +801,14 @@ def ping() -> dict:
         "mcp_path": "/mcp",
     })
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "debug_identity",
-    "Shows whether managed identity environment variables are present.",
-    {}
+    (
+        "Shows whether managed identity environment variables are present. "
+        "Use when token acquisition is failing to diagnose the root cause."
+    ),
+    {},
 )
 
 @mcp.tool
@@ -772,10 +821,15 @@ def debug_identity() -> dict:
         "MANAGED_IDENTITY_CLIENT_ID_present": bool(os.environ.get("MANAGED_IDENTITY_CLIENT_ID")),
     })
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "get_workspace_table_catalog",
-    "Returns the catalog of workspace tables grouped by telemetry type.",
-    {}
+    (
+        "Returns all workspace tables grouped by telemetry domain (e.g. identity_and_authentication, "
+        "endpoint_microsoft_defender). Use this to understand what data sources are available before "
+        "building queries or choosing which tables to search."
+    ),
+    {},
 )
 
 @mcp.tool
@@ -784,23 +838,29 @@ def get_workspace_table_catalog() -> dict:
         return _fail("Workspace table catalog not loaded", code="CATALOG_NOT_LOADED")
     return _ok({"catalog": WORKSPACE_TABLE_CATALOG})
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "debug_catalog_loaded",
-    "Returns whether the workspace catalog loaded and which keys are present.",
-    {}
+    "Returns whether the workspace catalog JSON loaded successfully and which domain keys are present.",
+    {},
 )
 
 @mcp.tool
 def debug_catalog_loaded() -> dict:
     return _ok({
         "loaded": bool(WORKSPACE_TABLE_CATALOG),
-        "keys": list(WORKSPACE_TABLE_CATALOG.keys())
+        "keys": list(WORKSPACE_TABLE_CATALOG.keys()),
     })
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "list_workspace_tables",
-    "Returns all unique tables from the workspace table catalog.",
-    {}
+    (
+        "Returns a flat list of all unique table names from the workspace catalog. "
+        "Use this when you need a simple table list. "
+        "Prefer get_workspace_table_catalog if you also need domain groupings."
+    ),
+    {},
 )
 
 @mcp.tool
@@ -809,10 +869,15 @@ def list_workspace_tables() -> dict:
         return _fail("Workspace table catalog not loaded", code="CATALOG_NOT_LOADED")
     return _ok({"tables": _flatten_catalog_tables()})
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "list_tables",
-    "Lists tables that ingested data within the given timespan using the Usage table.",
-    {"timespan": "ISO8601 duration like P1D, PT6H, PT24H"}
+    (
+        "Lists tables that actively ingested data within the given timespan by querying the Usage table. "
+        "Use this to discover which tables have recent data. "
+        "Prefer list_workspace_tables if you only need the static catalog."
+    ),
+    {"timespan": "ISO8601 duration like P1D, PT6H, PT24H"},
 )
 
 @mcp.tool
@@ -841,15 +906,24 @@ Usage
         return _fail("No tables returned from Log Analytics", code="EMPTY_RESULT", timespan=timespan)
 
     if "DataType" not in columns:
-        return _fail("Unexpected response shape: DataType column not present", code="PARSE_ERROR", timespan=timespan)
+        return _fail(
+            "Unexpected response shape: DataType column not present",
+            code="PARSE_ERROR",
+            timespan=timespan,
+        )
 
     idx = columns.index("DataType")
     return _ok({"tables": [row[idx] for row in rows]}, timespan=timespan)
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "preview_table",
-    "Shows a small preview (10 rows) from the specified table.",
-    {"table": "Table name string", "timespan": "ISO8601 duration"}
+    (
+        "Returns 10 sample rows from the specified table. "
+        "Use this to inspect raw log data or verify a table has the expected fields. "
+        "Use get_table_schema if you only need column names and types, not data."
+    ),
+    {"table": "Table name string", "timespan": "ISO8601 duration"},
 )
 
 @mcp.tool
@@ -863,10 +937,15 @@ def preview_table(table: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
     kql = f"{table} | take 10"
     return la_query(kql, timespan)
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "get_table_schema",
-    "Retrieves the schema (columns and types) for the specified table.",
-    {"table": "Table name string", "timespan": "ISO8601 duration"}
+    (
+        "Returns the column names and data types for the specified table using KQL getschema. "
+        "Use this before writing a run_query KQL to understand available fields. "
+        "Faster than preview_table when you only need structure, not data."
+    ),
+    {"table": "Table name string", "timespan": "ISO8601 duration"},
 )
 
 @mcp.tool
@@ -880,10 +959,21 @@ def get_table_schema(table: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
     kql = f"{table} | getschema"
     return la_query(kql, timespan)
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "run_query",
-    "Runs a bounded KQL query for the given timespan and returns up to max_rows rows.",
-    {"kql": "KQL string", "timespan": "ISO8601 duration", "max_rows": "integer <= 200"}
+    (
+        "Runs a custom bounded KQL query against the Sentinel workspace. "
+        "Use this for ad-hoc investigation queries that are not covered by the other tools. "
+        "Prefer analyze_entity for IOC lookups, get_incident_report for incident listing, "
+        "and investigate_incident for full incident deep-dives. "
+        "Query MUST contain at least one where clause. Max timespan 72h, max rows 200."
+    ),
+    {
+        "kql": "KQL string — must include at least one where clause",
+        "timespan": "ISO8601 duration, max PT72H / P3D",
+        "max_rows": "integer 1–200, default 50",
+    },
 )
 
 @mcp.tool
@@ -902,16 +992,86 @@ def run_query(kql: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAUL
         return _fail(
             f"Timespan exceeds allowed window ({MAX_HOURS_RUN_QUERY}h max)",
             code="VALIDATION_ERROR",
-            detail=f"got {hours}h"
+            detail=f"got {hours}h",
         )
 
     bounded_kql = ensure_take_limit(kql, clamp_rows(max_rows))
     return la_query(bounded_kql, timespan)
 
+# ─────────────────────────────────────────────────────────────
+_register_tool_def(
+    "get_recent_alerts",
+    (
+        "Returns recent Microsoft Sentinel security alerts filtered by severity and timespan. "
+        "Use this for a quick triage feed of what is firing in the environment. "
+        "Prefer investigate_incident when you already have an incident number."
+    ),
+    {
+        "timespan": "ISO8601 duration like P1D, PT6H",
+        "severity": "optional: High | Medium | Low | Informational (omit for all)",
+        "max_rows": "integer 1–200, default 50",
+    },
+)
+
+@mcp.tool
+def get_recent_alerts(
+    timespan: str = "P1D",
+    severity: Optional[str] = None,
+    max_rows: int = DEFAULT_ROWS,
+) -> dict:
+    try:
+        hours = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
+
+    if hours <= 0 or hours > MAX_HOURS_ANALYZE_ENTITY:
+        return _fail(
+            f"Timespan exceeds allowed window ({MAX_HOURS_ANALYZE_ENTITY}h max)",
+            code="VALIDATION_ERROR",
+        )
+
+    severity_filter = ""
+    if severity:
+        valid_severities = {"high", "medium", "low", "informational"}
+        if severity.lower() not in valid_severities:
+            return _fail(
+                f"Invalid severity. Must be one of: {', '.join(valid_severities)}",
+                code="VALIDATION_ERROR",
+            )
+        safe_sev = escape_kql_string(severity)
+        severity_filter = f'| where AlertSeverity =~ "{safe_sev}"'
+
+    limit = clamp_rows(max_rows)
+    kql = f"""
+SecurityAlert
+| where TimeGenerated >= ago({int(hours)}h)
+{severity_filter}
+| project
+    TimeGenerated,
+    AlertName,
+    AlertSeverity,
+    Status,
+    CompromisedEntity,
+    Tactics,
+    Techniques,
+    SystemAlertId,
+    ProductName,
+    Description
+| order by TimeGenerated desc
+| take {limit}
+""".strip()
+
+    return la_query(kql, timespan)
+
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "list_analytics_rules",
-    "Lists Microsoft Sentinel analytics rules in the configured workspace.",
-    {"top": "optional int; max rules to return (default 50, hard cap 200)"}
+    (
+        "Lists Microsoft Sentinel analytics rules in the configured workspace. "
+        "Returns rule_id, display_name, kind, enabled status, and severity. "
+        "Use analyze_use_case or generate_confluence_use_case to get full details for a single rule."
+    ),
+    {"top": "optional int, max rules to return (default 50, hard cap 200)"},
 )
 
 @mcp.tool
@@ -919,7 +1079,7 @@ def list_analytics_rules(top: int = 50) -> dict:
     if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
         return _fail(
             "SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
-            code="CONFIG_ERROR"
+            code="CONFIG_ERROR",
         )
 
     try:
@@ -931,7 +1091,8 @@ def list_analytics_rules(top: int = 50) -> dict:
     base = _sentinel_rules_base_url()
     url = f"{base}?api-version=2023-09-01-preview"
 
-    res = _arm_get(url)
+    # Use paginated fetch — large workspaces have more than one ARM page of rules
+    res = _arm_get_paged(url)
     if not res.get("ok"):
         return res
 
@@ -950,13 +1111,18 @@ def list_analytics_rules(top: int = 50) -> dict:
 
     return _ok({"count": len(out), "rules": out})
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "analyze_use_case",
-    "Fetch Sentinel analytic rule by rule_id or rule_name and extract documentation-ready key points.",
+    (
+        "Fetches a Sentinel analytic rule by rule_id or rule_name and extracts documentation-ready "
+        "key points including KQL summary, MITRE mappings, schedule, trigger thresholds, and entity hints. "
+        "Use list_analytics_rules first to find rule_id or exact display name."
+    ),
     {
-        "rule_id": "optional: analytic rule ARM resource name/guid",
-        "rule_name": "optional: displayName match (case-insensitive exact match preferred)"
-    }
+        "rule_id": "optional: analytic rule ARM resource name/GUID",
+        "rule_name": "optional: displayName exact match (case-insensitive)",
+    },
 )
 
 @mcp.tool
@@ -967,7 +1133,7 @@ def analyze_use_case(
     if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
         return _fail(
             "SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
-            code="CONFIG_ERROR"
+            code="CONFIG_ERROR",
         )
 
     rid = (rule_id or "").strip()
@@ -987,12 +1153,7 @@ def analyze_use_case(
 
     rule = res["data"] or {}
     props = rule.get("properties") or {}
-
     kql = props.get("query") or ""
-    tables = _extract_tables_from_kql(kql)
-    ops = _extract_ops_from_kql(kql)
-    thresholds = _extract_threshold_snippets(kql)
-    entities = _detect_entity_hints(kql)
 
     doc = {
         "rule_id": rule.get("name"),
@@ -1014,22 +1175,27 @@ def analyze_use_case(
         "kql": {
             "query": kql[:12000],
             "summary": _kql_one_liner_summary(kql),
-            "tables_used": tables[:25],
-            "operators_used": ops,
-            "threshold_hints": thresholds,
-            "entity_field_hints": entities,
+            "tables_used": _extract_tables_from_kql(kql)[:25],
+            "operators_used": _extract_ops_from_kql(kql),
+            "threshold_hints": _extract_threshold_snippets(kql),
+            "entity_field_hints": _detect_entity_hints(kql),
         },
     }
 
     return _ok(doc)
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "generate_confluence_use_case",
-    "Generate a Confluence-ready documentation page for a Sentinel analytic rule.",
+    (
+        "Generates a Confluence-ready HTML documentation page for a Sentinel analytic rule, "
+        "including MITRE ATT&CK table, KQL, log sources, and entity mapping. "
+        "Use list_analytics_rules first to find the rule_id or exact display name."
+    ),
     {
-        "rule_id": "optional: analytic rule ARM resource name/guid",
-        "rule_name": "optional: displayName match (case-insensitive exact match preferred)"
-    }
+        "rule_id": "optional: analytic rule ARM resource name/GUID",
+        "rule_name": "optional: displayName exact match (case-insensitive)",
+    },
 )
 
 @mcp.tool
@@ -1040,7 +1206,7 @@ def generate_confluence_use_case(
     if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
         return _fail(
             "SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
-            code="CONFIG_ERROR"
+            code="CONFIG_ERROR",
         )
 
     rid = (rule_id or "").strip()
@@ -1079,20 +1245,23 @@ def generate_confluence_use_case(
     }
 
     html = _build_confluence_html(doc)
+    return _ok({"rule_name": props.get("displayName"), "confluence_html": html})
 
-    return _ok({
-        "rule_name": props.get("displayName"),
-        "confluence_html": html
-    })
-
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "analyze_entity",
-    "SOC-style entity investigation across common Sentinel tables. Supports ip, user, host, domain, hash.",
+    (
+        "SOC-style entity investigation across common Sentinel tables. "
+        "Auto-detects entity type (ip, user/UPN, host, domain, sha256/sha1/md5) from the value string. "
+        "Returns per-table event counts, first/last seen times, risk level, and CMDB context. "
+        "Queries run in parallel so results arrive within the wall-clock timeout. "
+        "Use run_query for custom follow-up queries on a specific table."
+    ),
     {
-        "value": "Entity string (IP, UPN, hostname, domain, hash, etc.)",
+        "value": "Entity string — IP address, UPN, hostname, domain, or file hash",
         "timespan": "ISO8601 duration (PT6H, P1D, P7D)",
-        "max_rows": "integer <= 200"
-    }
+        "max_rows": "integer 1–200 (default 50)",
+    },
 )
 
 @mcp.tool
@@ -1109,7 +1278,7 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
         return _fail(
             f"Timespan exceeds allowed window ({MAX_HOURS_ANALYZE_ENTITY}h max)",
             code="VALIDATION_ERROR",
-            detail=f"got {hours}h"
+            detail=f"got {hours}h",
         )
 
     entity_type = detect_entity_type(value)
@@ -1117,25 +1286,29 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
     max_rows = clamp_rows(max_rows)
 
     preferred_domains = _catalog_domains_for_entity(entity_type)
-    preferred_tables = set(_catalog_tables_for_domains(preferred_domains))
+
+    # Build catalog-aware preferred set — but do NOT skip tables that are in
+    # the hardcoded table_map just because they're absent from the catalog.
+    # The catalog may be incomplete; we filter only when the catalog IS loaded.
+    preferred_tables = set(_catalog_tables_for_domains(preferred_domains)) if WORKSPACE_TABLE_CATALOG else set()
 
     table_map = {
         "ip": [
-            ("SigninLogs", f'IPAddress == "{safe_value}"'),
-            ("SecurityAlert", f'CompromisedEntity contains "{safe_value}" or tostring(Entities) contains "{safe_value}"'),
-            ("AzureActivity", f'CallerIpAddress == "{safe_value}"'),
+            ("SigninLogs",        f'IPAddress == "{safe_value}"'),
+            ("SecurityAlert",     f'CompromisedEntity contains "{safe_value}" or tostring(Entities) contains "{safe_value}"'),
+            ("AzureActivity",     f'CallerIpAddress == "{safe_value}"'),
             ("DeviceNetworkEvents", f'RemoteIP == "{safe_value}" or LocalIP == "{safe_value}"'),
         ],
         "user": [
-            ("SigninLogs", f'UserPrincipalName =~ "{safe_value}"'),
-            ("SecurityEvent", f'Account =~ "{safe_value}"'),
-            ("AuditLogs", f'tostring(InitiatedBy.user.userPrincipalName) =~ "{safe_value}"'),
+            ("SigninLogs",        f'UserPrincipalName =~ "{safe_value}"'),
+            ("SecurityEvent",     f'Account =~ "{safe_value}"'),          # now included
+            ("AuditLogs",         f'tostring(InitiatedBy.user.userPrincipalName) =~ "{safe_value}"'),  # now included
             ("DeviceLogonEvents", f'AccountName =~ "{safe_value}" or InitiatingProcessAccountUpn =~ "{safe_value}"'),
         ],
         "domain": [
             ("DeviceNetworkEvents", f'RemoteUrl contains "{safe_value}"'),
-            ("UrlClickEvents", f'Url contains "{safe_value}"'),
-            ("EmailUrlInfo", f'Url contains "{safe_value}"'),
+            ("UrlClickEvents",      f'Url contains "{safe_value}"'),
+            ("EmailUrlInfo",        f'Url contains "{safe_value}"'),
         ],
         "sha256": [
             ("DeviceFileEvents", f'SHA256 == "{safe_value}"'),
@@ -1147,34 +1320,42 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
             ("DeviceFileEvents", f'MD5 == "{safe_value}"'),
         ],
         "host": [
-            ("DeviceInfo", f'DeviceName =~ "{safe_value}"'),
-            ("DeviceEvents", f'DeviceName =~ "{safe_value}"'),
+            ("DeviceInfo",     f'DeviceName =~ "{safe_value}"'),
+            ("DeviceEvents",   f'DeviceName =~ "{safe_value}"'),
             ("DeviceProcessEvents", f'DeviceName =~ "{safe_value}"'),
-            ("SecurityAlert", f'CompromisedEntity contains "{safe_value}" or tostring(Entities) contains "{safe_value}"'),
+            ("SecurityAlert",  f'CompromisedEntity contains "{safe_value}" or tostring(Entities) contains "{safe_value}"'),
         ],
     }
 
-    queries = table_map.get(entity_type, [])[:6]
+    raw_queries = table_map.get(entity_type, [])[:6]
+
+    # Build parallel task list — include tables even if not in preferred_tables
+    # (catalog may be incomplete). Only hard-skip when catalog is loaded AND
+    # explicitly excludes a table from every domain we care about.
+    tasks = []
+    for table, where_clause in raw_queries:
+        if preferred_tables and table not in preferred_tables:
+            # Table not in catalog at all — still run it; just log a warning
+            logger.debug("Table %s not in preferred set for %s — running anyway", table, entity_type)
+        summary_kql = f"""
+{table}
+| where {where_clause}
+| summarize Count=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated)
+""".strip()
+        tasks.append((table, table, summary_kql))
+
+    # ── Parallel execution ─────────────────────────────────────────────────
+    query_results = _run_queries_parallel(tasks, timespan)
 
     findings = []
     total_events = 0
     risk_score = 0
     tables_checked = []
 
-    for table, where_clause in queries:
-        if preferred_tables and table not in preferred_tables:
-            continue
-
+    for table, _table_label, _kql in tasks:
         tables_checked.append(table)
-
-        summary_kql = f"""
-{table}
-| where {where_clause}
-| summarize Count=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated)
-""".strip()
-
-        res = la_query(summary_kql, timespan)
-        if not res.get("ok"):
+        res = query_results.get(table)
+        if not res or not res.get("ok"):
             continue
 
         rows = _la_first_table_dicts(res["data"])
@@ -1183,9 +1364,6 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
 
         row = rows[0]
         count = int(row.get("Count") or 0)
-        first_seen = row.get("FirstSeen")
-        last_seen = row.get("LastSeen")
-
         if count == 0:
             continue
 
@@ -1202,10 +1380,11 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
         findings.append({
             "table": table,
             "count": count,
-            "first_seen": first_seen,
-            "last_seen": last_seen,
+            "first_seen": row.get("FirstSeen"),
+            "last_seen": row.get("LastSeen"),
         })
 
+    # CMDB enrichment (runs after parallel block — low latency, single query)
     cmdb_context = None
     if entity_type in {"ip", "host", "domain"}:
         cmdb_res = _query_cmdb_entity(value, timespan)
@@ -1232,21 +1411,28 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
         "results": findings,
     })
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "get_incident_report",
-    "List Sentinel incidents or generate a SOC incident report. If incident_id is omitted, returns recent incidents.",
+    (
+        "Lists recent Sentinel incidents or generates a structured SOC report for a single incident. "
+        "Omit incident_id to get a list of recent incidents. "
+        "Provide incident_id (incident number or name) to get a detailed report including linked alerts, "
+        "entities, tactics, and risk level. "
+        "Use investigate_incident for a deeper investigation with parallel entity lookups."
+    ),
     {
-        "incident_id": "optional: Sentinel incident number or name",
+        "incident_id": "optional: Sentinel incident number or IncidentName",
         "timespan": "ISO8601 duration like P1D, P7D",
-        "top": "optional number of incidents to list (default 10)"
-    }
+        "top": "optional: number of incidents to list (default 50, max 200)",
+    },
 )
 
 @mcp.tool
 def get_incident_report(
     incident_id: Optional[str] = None,
     timespan: str = "P7D",
-    top: int = 50
+    top: int = 50,
 ) -> dict:
     try:
         hours = parse_timespan_to_hours(timespan)
@@ -1255,9 +1441,7 @@ def get_incident_report(
 
     top = clamp_rows(top)
 
-    # --------------------------------
-    # MODE 1 — LIST INCIDENTS
-    # --------------------------------
+    # ── MODE 1: LIST INCIDENTS ─────────────────────────────────────────────
     if not incident_id:
         if hours.is_integer():
             ago_expr = f"{int(hours)}h"
@@ -1270,13 +1454,7 @@ SecurityIncident
 | where CreatedTime >= ago({ago_expr})
 | summarize arg_max(LastModifiedTime, *) by IncidentNumber
 | project
-    IncidentNumber,
-    Title,
-    Severity,
-    Status,
-    Owner,
-    CreatedTime,
-    LastModifiedTime
+    IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime
 | order by CreatedTime desc
 | take {top}
 """.strip()
@@ -1289,15 +1467,9 @@ SecurityIncident
         if not incidents:
             return _fail("No incidents found", code="EMPTY_RESULT")
 
-        return _ok({
-            "mode": "list",
-            "count": len(incidents),
-            "incidents": incidents
-        })
+        return _ok({"mode": "list", "count": len(incidents), "incidents": incidents})
 
-    # --------------------------------
-    # MODE 2 — INCIDENT REPORT
-    # --------------------------------
+    # ── MODE 2: INCIDENT REPORT ────────────────────────────────────────────
     safe_id = escape_kql_string(str(incident_id))
 
     kql = f"""
@@ -1332,13 +1504,7 @@ SecurityIncident
     FirstAlert = min(AlertTime),
     LastAlert = max(AlertTime)
     by
-    IncidentNumber,
-    Title,
-    Severity,
-    Status,
-    Owner,
-    CreatedTime,
-    LastModifiedTime
+    IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime
 """.strip()
 
     res = la_query(kql, timespan)
@@ -1351,13 +1517,7 @@ SecurityIncident
 
     incident = incidents[0]
     severity = (incident.get("Severity") or "").lower()
-
-    if severity == "high":
-        risk = "High"
-    elif severity == "medium":
-        risk = "Medium"
-    else:
-        risk = "Low"
+    risk = "High" if severity == "high" else ("Medium" if severity == "medium" else "Low")
 
     return _ok({
         "mode": "report",
@@ -1377,16 +1537,23 @@ SecurityIncident
         "techniques": incident.get("TechniquesSet"),
         "first_alert": incident.get("FirstAlert"),
         "last_alert": incident.get("LastAlert"),
-        "risk_level": risk
+        "risk_level": risk,
     })
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "investigate_incident",
-    "SOC investigation of a Microsoft Sentinel incident. Extracts alerts, entities, MITRE techniques, and timeline indicators.",
+    (
+        "Full SOC investigation of a Sentinel incident. "
+        "Extracts alerts, parses entity lists (users, IPs, hosts, domains), "
+        "builds MITRE timeline, enriches with CMDB context, and calculates risk level. "
+        "Alert and CMDB queries run in parallel to stay within timeout. "
+        "Use get_incident_report for a lighter-weight summary."
+    ),
     {
         "incident_id": "Sentinel incident number",
-        "timespan": "ISO8601 duration (P1D, P7D)"
-    }
+        "timespan": "ISO8601 duration (P1D, P7D)",
+    },
 )
 
 @mcp.tool
@@ -1403,7 +1570,7 @@ def investigate_incident(incident_id: str, timespan: str = "P7D") -> dict:
         return _fail(
             f"Timespan exceeds allowed window ({MAX_HOURS_INCIDENT}h max)",
             code="VALIDATION_ERROR",
-            detail=f"got {hours}h"
+            detail=f"got {hours}h",
         )
 
     safe_id = escape_kql_string(str(incident_id))
@@ -1440,7 +1607,7 @@ SecurityIncident
             "timeline": {},
             "mitre": {},
             "risk_level": "Low",
-            "assessment": "Incident has no linked alerts"
+            "assessment": "Incident has no linked alerts",
         })
 
     safe_alerts = [escape_kql_string(str(a)) for a in alert_ids if a]
@@ -1466,45 +1633,34 @@ SecurityAlert
 
     alerts = _la_first_table_dicts(alert_res["data"])
 
-    users = set()
-    ips = set()
-    hosts = set()
-    domains = set()
+    users: set = set()
+    ips: set = set()
+    hosts: set = set()
+    domains: set = set()
 
     for alert in alerts:
         entities = alert.get("Entities")
         if not entities:
             continue
-
         try:
             ent_list = json.loads(entities) if isinstance(entities, str) else entities
         except Exception:
             continue
-
         if not isinstance(ent_list, list):
             continue
 
         for e in ent_list:
             if not isinstance(e, dict):
                 continue
-
             etype = (e.get("Type") or "").lower()
-
-            if etype == "account":
-                if e.get("Name"):
-                    users.add(e.get("Name"))
-
-            elif etype == "ip":
-                if e.get("Address"):
-                    ips.add(e.get("Address"))
-
-            elif etype in ["host", "machine"]:
-                if e.get("HostName"):
-                    hosts.add(e.get("HostName"))
-
-            elif etype == "dns":
-                if e.get("DomainName"):
-                    domains.add(e.get("DomainName"))
+            if etype == "account" and e.get("Name"):
+                users.add(e["Name"])
+            elif etype == "ip" and e.get("Address"):
+                ips.add(e["Address"])
+            elif etype in ["host", "machine"] and e.get("HostName"):
+                hosts.add(e["HostName"])
+            elif etype == "dns" and e.get("DomainName"):
+                domains.add(e["DomainName"])
 
     alert_times = [a.get("AlertTime") for a in alerts if a.get("AlertTime")]
     first_alert = min(alert_times) if alert_times else None
@@ -1513,19 +1669,23 @@ SecurityAlert
     tactics = sorted({a.get("Tactics") for a in alerts if a.get("Tactics")})
     techniques = sorted({a.get("Techniques") for a in alerts if a.get("Techniques")})
 
-    cmdb_context = []
+    # ── Parallel CMDB enrichment for extracted entities ────────────────────
+    cmdb_pivots = list(ips)[:3] + list(hosts)[:3] + list(domains)[:3]
+    cmdb_tasks = [
+        (pivot, pivot, f'{CMDB_TABLE} | where tostring(*) contains "{escape_kql_string(str(pivot))}" | take 5')
+        for pivot in cmdb_pivots
+    ]
 
-    for pivot in list(ips)[:3] + list(hosts)[:3] + list(domains)[:3]:
-        cmdb_res = _query_cmdb_entity(str(pivot), timespan)
-        if cmdb_res.get("ok"):
-            cmdb_context.append({
-                "entity": pivot,
-                "result": cmdb_res["data"]
-            })
+    cmdb_context = []
+    if cmdb_tasks:
+        cmdb_results = _run_queries_parallel(cmdb_tasks, timespan)
+        for pivot in cmdb_pivots:
+            res = cmdb_results.get(pivot)
+            if res and res.get("ok"):
+                cmdb_context.append({"entity": pivot, "result": res["data"]})
 
     risk_score = 0
     sev = (incident.get("Severity") or "").lower()
-
     if sev == "high":
         risk_score += 4
     elif sev == "medium":
@@ -1579,26 +1739,26 @@ SecurityAlert
             "techniques": techniques,
         },
         "asset_context": cmdb_context,
-        "risk_level": risk_level
+        "risk_level": risk_level,
     })
 
+# ─────────────────────────────────────────────────────────────
 _register_tool_def(
     "get_similar_incident_history",
-    "Looks up incidents from the last N days with the same title as the target incident and returns prior classifications, comments, and status history for triage context.",
+    (
+        "Looks up prior Sentinel incidents over the last N days that share the same title as the "
+        "target incident. Returns classification history, status breakdown, and owner info for triage. "
+        "Useful for determining if an incident is a known false positive or recurring pattern. "
+        "Tries exact normalized title match first, falls back to contains match."
+    ),
     {
         "incident_id": "Sentinel incident number",
-        "days": "optional integer, default 30"
-    }
+        "days": "optional integer 1–90, default 30",
+    },
 )
 
 @mcp.tool
 def get_similar_incident_history(incident_id: str, days: int = 30) -> dict:
-    """
-    Retrieve prior incidents with the same or similar title over the last N days.
-    Exact normalized title match is attempted first; if no rows are found,
-    a normalized contains match is used as fallback.
-    """
-
     if not incident_id:
         return _fail("incident_id is required", code="VALIDATION_ERROR")
 
@@ -1610,9 +1770,7 @@ def get_similar_incident_history(incident_id: str, days: int = 30) -> dict:
     days_i = max(1, min(days_i, 90))
     safe_id = escape_kql_string(str(incident_id).strip())
 
-    # --------------------------------------------------
-    # STEP 1 - Get the reference incident and its title
-    # --------------------------------------------------
+    # ── STEP 1: get the reference incident and its title ───────────────────
     current_kql = f"""
 SecurityIncident
 | where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
@@ -1637,9 +1795,16 @@ SecurityIncident
     normalized_title = str(title).strip().lower()
     safe_title = escape_kql_string(normalized_title)
 
-    # --------------------------------------------------
-    # STEP 2 - Exact normalized title match first
-    # --------------------------------------------------
+    _HISTORY_PROJECT = """
+| project
+    IncidentNumber, IncidentName, Title, Severity, Status,
+    Classification, ClassificationReason, ClassificationComment,
+    Owner, CreatedTime, LastModifiedTime, ModifiedBy,
+    Labels, AdditionalData, Tasks, IncidentUrl
+| order by CreatedTime desc
+""".strip()
+
+    # ── STEP 2: exact normalized title match ──────────────────────────────
     exact_kql = f"""
 SecurityIncident
 | where CreatedTime >= ago({days_i}d)
@@ -1647,24 +1812,7 @@ SecurityIncident
 | summarize arg_max(LastModifiedTime, *) by IncidentNumber
 | extend NormalizedTitle = tolower(trim(@" ", tostring(Title)))
 | where NormalizedTitle == "{safe_title}"
-| project
-    IncidentNumber,
-    IncidentName,
-    Title,
-    Severity,
-    Status,
-    Classification,
-    ClassificationReason,
-    ClassificationComment,
-    Owner,
-    CreatedTime,
-    LastModifiedTime,
-    ModifiedBy,
-    Labels,
-    AdditionalData,
-    Tasks,
-    IncidentUrl
-| order by CreatedTime desc
+{_HISTORY_PROJECT}
 """.strip()
 
     exact_res = la_query(exact_kql, f"P{days_i}D")
@@ -1672,12 +1820,9 @@ SecurityIncident
         return exact_res
 
     exact_incidents = _la_first_table_dicts(exact_res["data"])
-
     match_mode = "exact_normalized_title"
 
-    # --------------------------------------------------
-    # STEP 3 - Fallback to contains match if needed
-    # --------------------------------------------------
+    # ── STEP 3: fallback to contains match ────────────────────────────────
     if exact_incidents:
         incidents = exact_incidents
     else:
@@ -1688,24 +1833,7 @@ SecurityIncident
 | summarize arg_max(LastModifiedTime, *) by IncidentNumber
 | extend NormalizedTitle = tolower(trim(@" ", tostring(Title)))
 | where NormalizedTitle contains "{safe_title}"
-| project
-    IncidentNumber,
-    IncidentName,
-    Title,
-    Severity,
-    Status,
-    Classification,
-    ClassificationReason,
-    ClassificationComment,
-    Owner,
-    CreatedTime,
-    LastModifiedTime,
-    ModifiedBy,
-    Labels,
-    AdditionalData,
-    Tasks,
-    IncidentUrl
-| order by CreatedTime desc
+{_HISTORY_PROJECT}
 """.strip()
 
         contains_res = la_query(contains_kql, f"P{days_i}D")
@@ -1715,16 +1843,13 @@ SecurityIncident
         incidents = _la_first_table_dicts(contains_res["data"])
         match_mode = "contains_normalized_title"
 
-    # --------------------------------------------------
-    # STEP 4 - Build simple recurrence summary
-    # --------------------------------------------------
+    # ── STEP 4: recurrence summary ────────────────────────────────────────
     classification_summary: Dict[str, int] = {}
     status_summary: Dict[str, int] = {}
 
     for inc in incidents:
         cls = str(inc.get("Classification") or "Unclassified")
         st = str(inc.get("Status") or "Unknown")
-
         classification_summary[cls] = classification_summary.get(cls, 0) + 1
         status_summary[st] = status_summary.get(st, 0) + 1
 
