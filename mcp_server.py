@@ -12,6 +12,14 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 
+# ── Application Insights telemetry ────────────────────────────────────────────
+try:
+    from applicationinsights import TelemetryClient
+    _APPINSIGHTS_KEY = os.environ.get("APPINSIGHTS_INSTRUMENTATIONKEY") or os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING")
+    _telemetry_client: Optional[TelemetryClient] = TelemetryClient(_APPINSIGHTS_KEY) if _APPINSIGHTS_KEY else None
+except ImportError:
+    _telemetry_client = None
+
 # ============================================================
 # MCP SETUP
 # ============================================================
@@ -1872,7 +1880,147 @@ SecurityIncident
     })
 
 # ============================================================
+# CALLER IDENTITY MIDDLEWARE  (Azure EasyAuth)
+# ============================================================
+# Azure EasyAuth validates the Entra ID token before the request
+# reaches this code and injects pre-decoded identity headers:
+#
+#   X-MS-CLIENT-PRINCIPAL-NAME  → UPN / email (users) or app display name (SPs)
+#   X-MS-CLIENT-PRINCIPAL-ID    → Entra Object ID  (stable, unique)
+#   X-MS-CLIENT-PRINCIPAL-IDP   → identity provider, e.g. "aad"
+#   X-MS-CLIENT-PRINCIPAL       → base64 JSON with all claims
+#
+# If EasyAuth is bypassed (e.g. local dev / warm-up ping) all fields
+# fall back to "unauthenticated" so logging never crashes.
+# ============================================================
+
+import base64 as _base64
+
+def _parse_easyauth_principal(raw_b64: str) -> dict:
+    """Decode the X-MS-CLIENT-PRINCIPAL base64 blob into a claims dict."""
+    try:
+        padding = 4 - len(raw_b64) % 4
+        padded  = raw_b64 + ("=" * (padding % 4))
+        payload = _base64.b64decode(padded).decode("utf-8", errors="replace")
+        data    = json.loads(payload)
+        # Shape: {"auth_typ": "aad", "claims": [{"typ": "...", "val": "..."}], ...}
+        claims  = {c["typ"]: c["val"] for c in data.get("claims", []) if "typ" in c and "val" in c}
+        return claims
+    except Exception:
+        return {}
+
+
+def _log_caller(scope: dict) -> None:
+    """Extract EasyAuth identity from ASGI scope headers and log to App Insights + stdout."""
+    headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope.get("headers", [])}
+
+    # ── EasyAuth injected headers ──────────────────────────────────────────
+    principal_name = headers.get("x-ms-client-principal-name", "")
+    principal_id   = headers.get("x-ms-client-principal-id", "")
+    principal_idp  = headers.get("x-ms-client-principal-idp", "")
+    principal_b64  = headers.get("x-ms-client-principal", "")
+
+    # ── Decode full claims for richer identity ─────────────────────────────
+    claims = _parse_easyauth_principal(principal_b64) if principal_b64 else {}
+
+    # Prefer app display name for service principals, UPN for users
+    app_id       = claims.get("appid") or claims.get("azp", "")          # SP client_id
+    app_name     = claims.get("app_displayname", "")                       # SP display name
+    upn          = claims.get("upn") or claims.get("preferred_username", "")  # human user
+    tenant_id    = claims.get("tid", "")
+
+    # Friendly caller label: app name > UPN > principal_name > "unauthenticated"
+    caller_label = app_name or upn or principal_name or "unauthenticated"
+
+    # ── Request metadata ───────────────────────────────────────────────────
+    path        = scope.get("path", "unknown")
+    method      = scope.get("method", "unknown")
+    user_agent  = headers.get("user-agent", "unknown")
+    ip = (
+        headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (scope.get("client") or ["unknown"])[0]
+    )
+
+    properties = {
+        # Identity
+        "caller":        caller_label,
+        "principal_id":  principal_id  or "unknown",
+        "principal_idp": principal_idp or "unknown",
+        "app_id":        app_id        or "unknown",
+        "upn":           upn           or "unknown",
+        "tenant_id":     tenant_id     or "unknown",
+        # Request
+        "path":          path,
+        "method":        method,
+        "ip":            ip,
+        "user_agent":    user_agent,
+    }
+
+    logger.info(
+        "MCP_CALLER | caller=%s principal_id=%s app_id=%s tenant=%s ip=%s path=%s",
+        caller_label, principal_id or "?", app_id or "?", tenant_id or "?", ip, path,
+    )
+
+    if _telemetry_client:
+        try:
+            _telemetry_client.track_event("MCPCallerRequest", properties=properties)
+            _telemetry_client.flush()
+        except Exception as exc:
+            logger.warning("AppInsights log failed: %s", exc)
+
+
+class CallerIdentityMiddleware:
+    """Thin ASGI middleware — logs EasyAuth caller identity on every HTTP request."""
+
+    def __init__(self, app):
+        self._app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            try:
+                _log_caller(scope)
+            except Exception as exc:
+                logger.warning("CallerIdentityMiddleware error: %s", exc)
+        await self._app(scope, receive, send)
+
+
+# ============================================================
+# ACCEPT HEADER MIDDLEWARE
+# ============================================================
+# Foundry's A2A tool enumeration only sends 'application/json'
+# but FastMCP requires both 'application/json' and
+# 'text/event-stream'. This middleware injects the correct
+# Accept header if it is missing so FastMCP never returns 406.
+# ============================================================
+
+class AcceptHeaderMiddleware:
+    """Ensures every request carries the Accept header FastMCP requires."""
+
+    _REQUIRED_ACCEPT = b"application/json, text/event-stream"
+
+    def __init__(self, app):
+        self._app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            try:
+                headers = [
+                    (k, v) for k, v in scope.get("headers", [])
+                    if k.lower() != b"accept"
+                ]
+                headers.append((b"accept", self._REQUIRED_ACCEPT))
+                scope["headers"] = headers
+            except Exception as exc:
+                logger.warning("AcceptHeaderMiddleware error: %s", exc)
+        await self._app(scope, receive, send)
+
+
+# ============================================================
 # EXPORT ASGI APP
 # ============================================================
 
-asgi_app = mcp.http_app(path="/mcp", stateless_http=True)
+asgi_app = AcceptHeaderMiddleware(
+    CallerIdentityMiddleware(
+        mcp.http_app(path="/mcp", stateless_http=True)
+    )
+)
