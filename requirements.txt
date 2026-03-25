@@ -3,6 +3,7 @@
 # azure-monitor-opentelemetry
 
 azure-functions
-fastmcp
+fastmcp==2.3.4
 requests
 pydantic>=2.0
+applicationinsights
